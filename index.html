@@ -1,0 +1,202 @@
+
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="CoveyAI — платформа для поиска и подготовки видеоконтента.">
+  <title>CoveyAI — Create Without Limits</title>
+  <style>
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: Arial, sans-serif;
+      color: #f5f5f5;
+      background: #080808;
+    }
+
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 24px 8%;
+      border-bottom: 1px solid #242424;
+    }
+
+    .logo {
+      font-size: 25px;
+      font-weight: 800;
+      letter-spacing: 2px;
+    }
+
+    nav a {
+      color: #aaa;
+      text-decoration: none;
+      margin-left: 24px;
+      font-size: 14px;
+    }
+
+    nav a:hover { color: white; }
+
+    .hero {
+      min-height: 590px;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+      text-align: center;
+      padding: 70px 20px;
+      background: radial-gradient(ellipse at center, #242424 0%, #080808 65%);
+    }
+
+    .tag {
+      color: #aaa;
+      border: 1px solid #444;
+      border-radius: 30px;
+      padding: 9px 17px;
+      font-size: 12px;
+      letter-spacing: 2px;
+    }
+
+    h1 {
+      font-size: clamp(45px, 8vw, 85px);
+      margin: 28px 0 15px;
+      letter-spacing: -4px;
+    }
+
+    h1 span { color: #888; }
+
+    .hero p {
+      max-width: 570px;
+      color: #aaa;
+      line-height: 1.8;
+      font-size: 17px;
+    }
+
+    .button {
+      display: inline-block;
+      margin-top: 25px;
+      padding: 14px 25px;
+      background: #f2f2f2;
+      color: #080808;
+      border-radius: 8px;
+      text-decoration: none;
+      font-weight: bold;
+    }
+
+    section {
+      padding: 75px 8%;
+      text-align: center;
+    }
+
+    h2 { font-size: 32px; }
+
+    .muted {
+      color: #999;
+      line-height: 1.8;
+    }
+
+    .features {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 18px;
+      margin-top: 40px;
+    }
+
+    .feature {
+      padding: 28px;
+      text-align: left;
+      border: 1px solid #292929;
+      border-radius: 14px;
+      background: #111;
+    }
+
+    .feature h3 { margin-top: 0; }
+
+    .feature p {
+      color: #999;
+      line-height: 1.7;
+    }
+
+    footer {
+      padding: 30px 8%;
+      border-top: 1px solid #242424;
+      color: #888;
+      text-align: center;
+      font-size: 13px;
+    }
+
+    footer a {
+      color: #aaa;
+      margin: 0 10px;
+    }
+
+    @media (max-width: 600px) {
+      header { padding: 20px; }
+      nav a { margin-left: 10px; font-size: 12px; }
+      h1 { letter-spacing: -2px; }
+    }
+  </style>
+</head>
+
+<body>
+  <header>
+    <div class="logo">COVEY<span style="color:#888">AI</span></div>
+    <nav>
+      <a href="#about">О проекте</a>
+      <a href="#features">Возможности</a>
+    </nav>
+  </header>
+
+  <main>
+    <div class="hero">
+      <div class="tag">AI VIDEO PLATFORM</div>
+      <h1>Create Without <span>Limits.</span></h1>
+      <p>
+        CoveyAI — платформа для поиска, подготовки и организации
+        видеоконтента для социальных сетей.
+      </p>
+      <a class="button" href="#about">Узнать больше</a>
+    </div>
+
+    <section id="about">
+      <h2>О CoveyAI</h2>
+      <p class="muted">
+        Наша цель — сделать работу с видеоконтентом удобнее.
+        CoveyAI развивается как инструмент для авторов,
+        которые ищут идеи и готовят материалы для публикации.
+      </p>
+    </section>
+
+    <section id="features">
+      <h2>Возможности платформы</h2>
+      <div class="features">
+        <div class="feature">
+          <h3>Поиск видео</h3>
+          <p>Поиск видеоматериалов из доступных источников.</p>
+        </div>
+
+        <div class="feature">
+          <h3>Подготовка контента</h3>
+          <p>Инструменты для организации и подготовки видеоматериалов.</p>
+        </div>
+
+        <div class="feature">
+          <h3>Социальные сети</h3>
+          <p>Проектирование удобной работы с контентом для социальных платформ.</p>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <p>© 2026 CoveyAI. All rights reserved.</p>
+    <p>
+      <a href="terms.html">Условия использования</a>
+      <a href="privacy.html">Политика конфиденциальности</a>
+    </p>
+    <p>Contact: @zrikss</p>
+  </footer>
+</body>
+</html>
