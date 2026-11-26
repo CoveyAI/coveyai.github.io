@@ -93,11 +93,49 @@ def get_user(open_id):
 
 # ============== ERROR HANDLING ==============
 
-def tiktok_error(result):
+def oauth_error(response, result):
+    # TikTok OAuth v2 returns errors at the top level:
+    # {"error": "...", "error_description": "...", "log_id": "..."}
+    return {
+        "detail": "TikTok OAuth returned an error",
+        "http_status": response.status_code,
+        "tiktok_error": result.get("error", "unknown"),
+        "tiktok_message": result.get("error_description", ""),
+        "log_id": result.get("log_id"),
+    }
+
+
+def check_oauth_response(response):
+    try:
+        result = response.json()
+    except Exception:
+        raise HTTPException(
+            502,
+            detail={
+                "detail": "TikTok OAuth returned a non-JSON response",
+                "http_status": response.status_code,
+            },
+        )
+
+    if response.status_code != 200 or result.get("error"):
+        raise HTTPException(
+            502,
+            detail=oauth_error(response, result),
+        )
+
+    # OAuth v2 success response is FLAT: access_token, refresh_token,
+    # open_id, expires_in, refresh_expires_in. It is not wrapped in data.
+    return result
+
+
+def tiktok_error(response, result):
     error = result.get("error", {})
+    if not isinstance(error, dict):
+        error = {}
 
     return {
-        "detail": "TikTok returned an error",
+        "detail": "TikTok API returned an error",
+        "http_status": response.status_code,
         "tiktok_code": error.get("code", "unknown"),
         "tiktok_message": error.get("message", ""),
         "log_id": error.get("log_id") or result.get("log_id"),
@@ -110,19 +148,23 @@ def check_tiktok_response(response):
     except Exception:
         raise HTTPException(
             502,
-            "TikTok returned an unreadable response"
+            detail={
+                "detail": "TikTok API returned an unreadable response",
+                "http_status": response.status_code,
+            },
         )
 
     if response.status_code != 200:
         raise HTTPException(
             502,
-            detail=tiktok_error(result)
+            detail=tiktok_error(response, result),
         )
 
-    if result.get("error", {}).get("code") != "ok":
+    error = result.get("error", {})
+    if isinstance(error, dict) and error.get("code") not in (None, "ok"):
         raise HTTPException(
             400,
-            detail=tiktok_error(result)
+            detail=tiktok_error(response, result),
         )
 
     return result.get("data", {})
@@ -223,7 +265,7 @@ async def callback(request: Request):
             },
         )
 
-    data = check_tiktok_response(response)
+    data = check_oauth_response(response)
 
     required = [
         "open_id",
@@ -288,7 +330,7 @@ async def get_access_token(open_id):
             },
         )
 
-    data = check_tiktok_response(response)
+    data = check_oauth_response(response)
 
     data["open_id"] = open_id
     save_tokens(data)
