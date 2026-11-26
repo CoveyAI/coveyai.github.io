@@ -5,6 +5,7 @@ import sqlite3
 import math
 import time
 import html
+import hashlib
 
 import httpx
 from fastapi import FastAPI, Request, UploadFile, File, HTTPException
@@ -17,6 +18,11 @@ CLIENT_KEY = os.environ["TIKTOK_CLIENT_KEY"].strip()
 CLIENT_SECRET = os.environ["TIKTOK_CLIENT_SECRET"].strip()
 REDIRECT_URI = os.environ["TIKTOK_REDIRECT_URI"].strip()
 SESSION_SECRET = os.environ["SESSION_SECRET"]
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://coveyai-github-io.onrender.com").rstrip("/")
+TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}" if TELEGRAM_BOT_TOKEN else ""
+TELEGRAM_WEBHOOK_SECRET = hashlib.sha256(("CoveyAI:" + TELEGRAM_BOT_TOKEN).encode()).hexdigest() if TELEGRAM_BOT_TOKEN else ""
 
 DATABASE_PATH = os.getenv("DATABASE_PATH", "./coveyai.db")
 
@@ -479,3 +485,86 @@ async def upload_status(
         "success": True,
         "data": data
     }
+
+# ============== TELEGRAM BOT ==============
+
+async def telegram_call(method: str, payload: dict):
+    if not TELEGRAM_BOT_TOKEN:
+        return None
+    async with httpx.AsyncClient(timeout=20) as client:
+        response = await client.post(f"{TELEGRAM_API}/{method}", json=payload)
+        response.raise_for_status()
+        result = response.json()
+        if not result.get("ok"):
+            raise RuntimeError("Telegram API request failed")
+        return result.get("result")
+
+
+async def telegram_send(chat_id: int, text: str):
+    keyboard = {
+        "keyboard": [
+            [{"text": "🔎 Найти видео"}, {"text": "🎬 Мои видео"}],
+            [{"text": "📤 Отправить в TikTok"}, {"text": "⭐ Подписка"}],
+        ],
+        "resize_keyboard": True,
+    }
+    await telegram_call("sendMessage", {
+        "chat_id": chat_id,
+        "text": text,
+        "reply_markup": keyboard,
+    })
+
+
+@app.on_event("startup")
+async def configure_telegram_webhook():
+    if not TELEGRAM_BOT_TOKEN:
+        print("Telegram bot is not configured: TELEGRAM_BOT_TOKEN is missing")
+        return
+    webhook_url = f"{PUBLIC_BASE_URL}/telegram/webhook/{TELEGRAM_WEBHOOK_SECRET}"
+    try:
+        await telegram_call("setWebhook", {
+            "url": webhook_url,
+            "allowed_updates": ["message"],
+        })
+        print("CoveyAI Telegram webhook configured")
+    except Exception as exc:
+        # Do not prevent the TikTok API from starting if Telegram is temporarily unavailable.
+        print(f"Telegram webhook setup failed: {type(exc).__name__}")
+
+
+@app.post("/telegram/webhook/{secret}")
+async def telegram_webhook(secret: str, request: Request):
+    if not TELEGRAM_BOT_TOKEN or not secrets.compare_digest(secret, TELEGRAM_WEBHOOK_SECRET):
+        raise HTTPException(404, "Not found")
+
+    update = await request.json()
+    message = update.get("message") or {}
+    chat = message.get("chat") or {}
+    chat_id = chat.get("id")
+    text = (message.get("text") or "").strip()
+    if not chat_id or not text:
+        return {"ok": True}
+
+    if text.startswith("/start"):
+        await telegram_send(
+            chat_id,
+            "Привет! Это CoveyAI 🎬\n\n"
+            "Здесь будет поиск видео, предварительный просмотр, "
+            "обработка собственных видео или материалов с разрешением "
+            "и отправка в TikTok Inbox.\n\n"
+            "Выбери раздел в меню ниже.",
+        )
+    elif text.startswith("/help"):
+        await telegram_send(chat_id, "Используй меню CoveyAI. Функции подключаются поэтапно.")
+    elif text == "🔎 Найти видео":
+        await telegram_send(chat_id, "Поиск видео — следующий этап разработки. Используй только видео, на которые у тебя есть права или разрешение.")
+    elif text == "🎬 Мои видео":
+        await telegram_send(chat_id, "История видео появится после подключения обработки и сохранения заданий.")
+    elif text == "📤 Отправить в TikTok":
+        await telegram_send(chat_id, "Отправка через Telegram подключается следующим этапом. TikTok сейчас уже принимает тестовую загрузку через сервер.")
+    elif text == "⭐ Подписка":
+        await telegram_send(chat_id, "Тарифы и лимит 5 видео в день подключим на этапе подписок. Пока оплата не активна.")
+    else:
+        await telegram_send(chat_id, "Выбери действие в меню CoveyAI или отправь /help.")
+
+    return {"ok": True}
