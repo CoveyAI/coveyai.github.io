@@ -19,12 +19,16 @@ CLIENT_SECRET = os.environ["TIKTOK_CLIENT_SECRET"].strip()
 REDIRECT_URI = os.environ["TIKTOK_REDIRECT_URI"].strip()
 SESSION_SECRET = os.environ["SESSION_SECRET"]
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://coveyai-github-io.onrender.com").rstrip("/")
-TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}" if TELEGRAM_BOT_TOKEN else ""
-TELEGRAM_WEBHOOK_SECRET = hashlib.sha256(("CoveyAI:" + TELEGRAM_BOT_TOKEN).encode()).hexdigest() if TELEGRAM_BOT_TOKEN else ""
-
 DATABASE_PATH = os.getenv("DATABASE_PATH", "./coveyai.db")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+PUBLIC_BASE_URL = os.getenv(
+    "PUBLIC_BASE_URL", "https://coveyai-github-io.onrender.com"
+).rstrip("/")
+TELEGRAM_WEBHOOK_PATH_SECRET = hashlib.sha256(
+    SESSION_SECRET.encode("utf-8")
+).hexdigest()[:40]
+TELEGRAM_WEBHOOK_PATH = f"/telegram/webhook/{TELEGRAM_WEBHOOK_PATH_SECRET}"
+TELEGRAM_FILE_LIMIT = 20 * 1024 * 1024  # Telegram Bot API download limit
 
 AUTH_URL = "https://www.tiktok.com/v2/auth/authorize/"
 TOKEN_URL = "https://open.tiktokapis.com/v2/oauth/token/"
@@ -64,6 +68,28 @@ def init_db():
                 refresh_token TEXT NOT NULL,
                 expires_at INTEGER NOT NULL,
                 refresh_expires_at INTEGER NOT NULL
+            )
+        """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS telegram_accounts (
+                chat_id TEXT PRIMARY KEY,
+                open_id TEXT NOT NULL,
+                connected_at INTEGER NOT NULL
+            )
+        """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS pending_tiktok_links (
+                state TEXT PRIMARY KEY,
+                chat_id TEXT NOT NULL,
+                expires_at INTEGER NOT NULL
+            )
+        """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS telegram_uploads (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                publish_id TEXT NOT NULL
             )
         """)
 
@@ -198,7 +224,8 @@ async def home():
 async def health():
     return {
         "status": "ok",
-        "service": "CoveyAI"
+        "service": "CoveyAI",
+        "telegram_configured": bool(TELEGRAM_BOT_TOKEN),
     }
 
 
@@ -206,8 +233,19 @@ async def health():
 
 @app.get("/login")
 async def login(request: Request):
-    state = secrets.token_urlsafe(32)
-    request.session["oauth_state"] = state
+    supplied_state = request.query_params.get("state")
+    if supplied_state:
+        with db_connect() as db:
+            pending = db.execute(
+                "SELECT state, expires_at FROM pending_tiktok_links WHERE state = ?",
+                (supplied_state,),
+            ).fetchone()
+        if not pending or pending["expires_at"] < int(time.time()):
+            raise HTTPException(400, "This Telegram connection link is invalid or expired")
+        state = supplied_state
+    else:
+        state = secrets.token_urlsafe(32)
+        request.session["oauth_state"] = state
 
     params = {
         "client_key": CLIENT_KEY,
@@ -243,6 +281,13 @@ async def callback(request: Request):
     state = request.query_params.get("state")
 
     saved_state = request.session.pop("oauth_state", None)
+    pending_link = None
+    if state:
+        with db_connect() as db:
+            pending_link = db.execute(
+                "SELECT chat_id, expires_at FROM pending_tiktok_links WHERE state = ?",
+                (state,),
+            ).fetchone()
 
     if not code:
         return JSONResponse({
@@ -250,14 +295,17 @@ async def callback(request: Request):
             "received_parameters": list(request.query_params.keys()),
         }, status_code=400)
 
-    if not state or not saved_state:
-        return JSONResponse({
-            "detail": "OAuth state is missing",
-            "hint": "Start authorization again using /login",
-        }, status_code=400)
-
-    if not secrets.compare_digest(state, saved_state):
-        raise HTTPException(400, "OAuth state does not match")
+    is_telegram_link = bool(
+        pending_link and pending_link["expires_at"] >= int(time.time())
+    )
+    if not is_telegram_link:
+        if not state or not saved_state:
+            return JSONResponse({
+                "detail": "OAuth state is missing",
+                "hint": "Start authorization again using /login",
+            }, status_code=400)
+        if not secrets.compare_digest(state, saved_state):
+            raise HTTPException(400, "OAuth state does not match")
 
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.post(
@@ -289,6 +337,20 @@ async def callback(request: Request):
 
     save_tokens(data)
     request.session["tiktok_open_id"] = data["open_id"]
+
+    if is_telegram_link:
+        chat_id = pending_link["chat_id"]
+        with db_connect() as db:
+            db.execute(
+                "INSERT OR REPLACE INTO telegram_accounts (chat_id, open_id, connected_at) VALUES (?, ?, ?)",
+                (chat_id, data["open_id"], int(time.time())),
+            )
+            db.execute("DELETE FROM pending_tiktok_links WHERE state = ?", (state,))
+        await telegram_send_message(
+            chat_id,
+            "✅ TikTok успешно подключён к CoveyAI! Теперь отправьте видео через кнопку «Опубликовать видео».",
+            reply_markup=telegram_main_keyboard(),
+        )
 
     return HTMLResponse("""
     <html>
@@ -344,52 +406,21 @@ async def get_access_token(open_id):
     return data["access_token"]
 
 
-# ============== VIDEO UPLOAD ==============
-
-@app.post("/upload")
-async def upload_video(
-    request: Request,
-    file: UploadFile = File(...),
-):
-    open_id = request.session.get("tiktok_open_id")
-
-    if not open_id:
-        raise HTTPException(
-            401,
-            "Connect TikTok first using /login"
-        )
-
-    allowed_types = {
-        "video/mp4",
-        "video/quicktime",
-        "video/webm",
-    }
-
-    if file.content_type not in allowed_types:
-        raise HTTPException(
-            400,
-            "Supported formats: MP4, MOV, WEBM"
-        )
-
-    video = await file.read(MAX_VIDEO_SIZE + 1)
-
+async def upload_video_bytes(open_id, video, content_type):
+    allowed_types = {"video/mp4", "video/quicktime", "video/webm"}
+    if content_type not in allowed_types:
+        raise HTTPException(400, "Supported formats: MP4, MOV, WEBM")
     if not video:
         raise HTTPException(400, "Empty video")
-
     if len(video) > MAX_VIDEO_SIZE:
-        raise HTTPException(
-            413,
-            "Maximum video size is 512 MB"
-        )
+        raise HTTPException(413, "Maximum video size is 512 MB")
 
     video_size = len(video)
     chunk_size = min(CHUNK_SIZE, video_size)
     total_chunks = math.ceil(video_size / chunk_size)
-
     token = await get_access_token(open_id)
 
     async with httpx.AsyncClient(timeout=180) as client:
-
         init_response = await client.post(
             UPLOAD_INIT_URL,
             headers={
@@ -405,41 +436,44 @@ async def upload_video(
                 }
             },
         )
-
         upload_data = check_tiktok_response(init_response)
-
         upload_url = upload_data.get("upload_url")
         publish_id = upload_data.get("publish_id")
-
         if not upload_url or not publish_id:
-            raise HTTPException(
-                502,
-                "TikTok did not return upload information"
-            )
+            raise HTTPException(502, "TikTok did not return upload information")
 
         for index in range(total_chunks):
             start = index * chunk_size
             end = min(start + chunk_size, video_size)
             chunk = video[start:end]
-
             upload_response = await client.put(
                 upload_url,
                 content=chunk,
                 headers={
-                    "Content-Type": file.content_type,
+                    "Content-Type": content_type,
                     "Content-Length": str(len(chunk)),
-                    "Content-Range": (
-                        f"bytes {start}-{end - 1}/{video_size}"
-                    ),
+                    "Content-Range": f"bytes {start}-{end - 1}/{video_size}",
                 },
             )
-
             if upload_response.status_code not in (200, 201, 206):
-                raise HTTPException(
-                    502,
-                    "TikTok video transfer failed"
-                )
+                raise HTTPException(502, "TikTok video transfer failed")
 
+    return publish_id
+
+
+# ============== VIDEO UPLOAD ==============
+
+@app.post("/upload")
+async def upload_video(
+    request: Request,
+    file: UploadFile = File(...),
+):
+    open_id = request.session.get("tiktok_open_id")
+    if not open_id:
+        raise HTTPException(401, "Connect TikTok first using /login")
+
+    video = await file.read(MAX_VIDEO_SIZE + 1)
+    publish_id = await upload_video_bytes(open_id, video, file.content_type)
     return {
         "success": True,
         "publish_id": publish_id,
@@ -488,83 +522,265 @@ async def upload_status(
 
 # ============== TELEGRAM BOT ==============
 
-async def telegram_call(method: str, payload: dict):
-    if not TELEGRAM_BOT_TOKEN:
-        return None
-    async with httpx.AsyncClient(timeout=20) as client:
-        response = await client.post(f"{TELEGRAM_API}/{method}", json=payload)
-        response.raise_for_status()
-        result = response.json()
-        if not result.get("ok"):
-            raise RuntimeError("Telegram API request failed")
-        return result.get("result")
+TG_API = "https://api.telegram.org/bot{}"
+SITE_URL = "https://coveyai.github.io/"
 
 
-async def telegram_send(chat_id: int, text: str):
-    keyboard = {
+def telegram_main_keyboard():
+    return {
         "keyboard": [
-            [{"text": "🔎 Найти видео"}, {"text": "🎬 Мои видео"}],
-            [{"text": "📤 Отправить в TikTok"}, {"text": "⭐ Подписка"}],
+            [{"text": "🔎 Найти видео"}, {"text": "✨ Обработать видео"}],
+            [{"text": "🚀 Опубликовать видео"}, {"text": "💳 Монетизация"}],
+            [{"text": "📁 Мои файлы"}, {"text": "📊 Статистика"}],
+            [{"text": "👤 Мои аккаунты"}, {"text": "📱 Наше приложение"}],
         ],
         "resize_keyboard": True,
+        "is_persistent": True,
     }
-    await telegram_call("sendMessage", {
-        "chat_id": chat_id,
-        "text": text,
-        "reply_markup": keyboard,
-    })
+
+
+def telegram_accounts_keyboard():
+    return {
+        "keyboard": [
+            [{"text": "➕ Добавить аккаунт"}, {"text": "👁 Мои аккаунты"}],
+            [{"text": "TikTok"}, {"text": "Instagram"}],
+            [{"text": "YouTube"}, {"text": "⬅️ Главное меню"}],
+        ],
+        "resize_keyboard": True,
+        "is_persistent": True,
+    }
+
+
+async def telegram_api(method, payload=None):
+    if not TELEGRAM_BOT_TOKEN:
+        return None
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.post(
+            f"{TG_API.format(TELEGRAM_BOT_TOKEN)}/{method}",
+            json=payload or {},
+        )
+    try:
+        result = response.json()
+    except Exception:
+        result = {"ok": False, "description": "Telegram returned an unreadable response"}
+    if response.status_code != 200 or not result.get("ok"):
+        raise RuntimeError(result.get("description", "Telegram API error"))
+    return result.get("result")
+
+
+async def telegram_send_message(chat_id, text, reply_markup=None):
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    payload = {"chat_id": chat_id, "text": text}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    await telegram_api("sendMessage", payload)
+
+
+async def telegram_set_webhook():
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    try:
+        await telegram_api("setWebhook", {
+            "url": PUBLIC_BASE_URL + TELEGRAM_WEBHOOK_PATH,
+            "allowed_updates": ["message"],
+            "drop_pending_updates": False,
+        })
+    except Exception as exc:
+        # The API still starts; /health reports whether the token is configured.
+        print(f"Telegram webhook setup failed: {exc}")
 
 
 @app.on_event("startup")
 async def configure_telegram_webhook():
-    if not TELEGRAM_BOT_TOKEN:
-        print("Telegram bot is not configured: TELEGRAM_BOT_TOKEN is missing")
-        return
-    webhook_url = f"{PUBLIC_BASE_URL}/telegram/webhook/{TELEGRAM_WEBHOOK_SECRET}"
-    try:
-        await telegram_call("setWebhook", {
-            "url": webhook_url,
-            "allowed_updates": ["message"],
-        })
-        print("CoveyAI Telegram webhook configured")
-    except Exception as exc:
-        # Do not prevent the TikTok API from starting if Telegram is temporarily unavailable.
-        print(f"Telegram webhook setup failed: {type(exc).__name__}")
+    await telegram_set_webhook()
 
 
-@app.post("/telegram/webhook/{secret}")
-async def telegram_webhook(secret: str, request: Request):
-    if not TELEGRAM_BOT_TOKEN or not secrets.compare_digest(secret, TELEGRAM_WEBHOOK_SECRET):
-        raise HTTPException(404, "Not found")
+@app.get("/telegram/status")
+async def telegram_status():
+    return {
+        "configured": bool(TELEGRAM_BOT_TOKEN),
+        "webhook_url": PUBLIC_BASE_URL + TELEGRAM_WEBHOOK_PATH if TELEGRAM_BOT_TOKEN else None,
+    }
 
-    update = await request.json()
-    message = update.get("message") or {}
-    chat = message.get("chat") or {}
-    chat_id = chat.get("id")
-    text = (message.get("text") or "").strip()
-    if not chat_id or not text:
-        return {"ok": True}
 
-    if text.startswith("/start"):
-        await telegram_send(
-            chat_id,
-            "Привет! Это CoveyAI 🎬\n\n"
-            "Здесь будет поиск видео, предварительный просмотр, "
-            "обработка собственных видео или материалов с разрешением "
-            "и отправка в TikTok Inbox.\n\n"
-            "Выбери раздел в меню ниже.",
+def get_telegram_open_id(chat_id):
+    with db_connect() as db:
+        row = db.execute(
+            "SELECT open_id FROM telegram_accounts WHERE chat_id = ?",
+            (str(chat_id),),
+        ).fetchone()
+    return row["open_id"] if row else None
+
+
+async def telegram_start_tiktok_link(chat_id):
+    state = secrets.token_urlsafe(32)
+    with db_connect() as db:
+        db.execute(
+            "INSERT INTO pending_tiktok_links (state, chat_id, expires_at) VALUES (?, ?, ?)",
+            (state, str(chat_id), int(time.time()) + 600),
         )
-    elif text.startswith("/help"):
-        await telegram_send(chat_id, "Используй меню CoveyAI. Функции подключаются поэтапно.")
-    elif text == "🔎 Найти видео":
-        await telegram_send(chat_id, "Поиск видео — следующий этап разработки. Используй только видео, на которые у тебя есть права или разрешение.")
-    elif text == "🎬 Мои видео":
-        await telegram_send(chat_id, "История видео появится после подключения обработки и сохранения заданий.")
-    elif text == "📤 Отправить в TikTok":
-        await telegram_send(chat_id, "Отправка через Telegram подключается следующим этапом. TikTok сейчас уже принимает тестовую загрузку через сервер.")
-    elif text == "⭐ Подписка":
-        await telegram_send(chat_id, "Тарифы и лимит 5 видео в день подключим на этапе подписок. Пока оплата не активна.")
-    else:
-        await telegram_send(chat_id, "Выбери действие в меню CoveyAI или отправь /help.")
+    login_url = f"{PUBLIC_BASE_URL}/login?state={state}"
+    await telegram_send_message(
+        chat_id,
+        "Чтобы подключить TikTok, откройте персональную ссылку и подтвердите доступ в TikTok. Ссылка действует 10 минут:\n" + login_url,
+        reply_markup=telegram_accounts_keyboard(),
+    )
 
+
+async def telegram_download_file(file_id):
+    info = await telegram_api("getFile", {"file_id": file_id})
+    file_path = info.get("file_path") if info else None
+    if not file_path:
+        raise RuntimeError("Telegram не вернул файл")
+    file_size = info.get("file_size", 0)
+    if file_size and file_size > TELEGRAM_FILE_LIMIT:
+        raise RuntimeError("Через Telegram можно отправить видео размером до 20 МБ. Большие файлы добавим через сайт.")
+    url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
+    async with httpx.AsyncClient(timeout=90) as client:
+        response = await client.get(url)
+    if response.status_code != 200:
+        raise RuntimeError("Не удалось скачать видео из Telegram")
+    if len(response.content) > TELEGRAM_FILE_LIMIT:
+        raise RuntimeError("Видео превышает лимит Telegram 20 МБ")
+    return response.content
+
+
+async def handle_telegram_message(message):
+    chat = message.get("chat", {})
+    chat_id = chat.get("id")
+    if not chat_id:
+        return
+    text_value = (message.get("text") or "").strip()
+
+    if text_value in ("/start", "/menu", "⬅️ Главное меню"):
+        await telegram_send_message(
+            chat_id,
+            "Добро пожаловать в CoveyAI! Выберите нужный раздел в меню.",
+            reply_markup=telegram_main_keyboard(),
+        )
+        return
+
+    if text_value == "📱 Наше приложение":
+        await telegram_send_message(chat_id, "🌐 Откройте сайт CoveyAI:\n" + SITE_URL, telegram_main_keyboard())
+        return
+
+    if text_value == "👤 Мои аккаунты":
+        await telegram_send_message(chat_id, "Раздел аккаунтов. Здесь можно подключить TikTok и посмотреть подключённые аккаунты.", telegram_accounts_keyboard())
+        return
+
+    if text_value == "➕ Добавить аккаунт":
+        await telegram_send_message(
+            chat_id,
+            "Выберите платформу для подключения. Сейчас доступен TikTok.",
+            telegram_accounts_keyboard(),
+        )
+        return
+
+    if text_value == "TikTok":
+        await telegram_start_tiktok_link(chat_id)
+        return
+
+    if text_value == "👁 Мои аккаунты":
+        open_id = get_telegram_open_id(chat_id)
+        if open_id:
+            await telegram_send_message(chat_id, "✅ TikTok подключён.\nID аккаунта: " + html.escape(open_id), telegram_accounts_keyboard())
+        else:
+            await telegram_send_message(chat_id, "Пока не подключено ни одного аккаунта. Нажмите «➕ Добавить аккаунт», чтобы подключить TikTok.", telegram_accounts_keyboard())
+        return
+
+    if text_value == "🔎 Найти видео":
+        await telegram_send_message(chat_id, "🔎 Поиск видео — следующий модуль в разработке. Будем использовать только ваши видео или материалы, на которые у вас есть разрешение.", telegram_main_keyboard())
+        return
+
+    if text_value == "✨ Обработать видео":
+        await telegram_send_message(chat_id, "✨ ИИ-обработка и монтаж — следующий модуль. Он будет редактировать ваши видео, а не обходить авторские права или системы распознавания.", telegram_main_keyboard())
+        return
+
+    if text_value == "🚀 Опубликовать видео":
+        if not get_telegram_open_id(chat_id):
+            await telegram_send_message(chat_id, "Сначала подключите TikTok: «Мои аккаунты» → «Добавить аккаунт».", telegram_main_keyboard())
+        else:
+            await telegram_send_message(chat_id, "Отправьте сюда видео MP4, MOV или WEBM размером до 20 МБ. Я передам его в ваш TikTok Inbox как загрузку для дальнейшего оформления и публикации.", telegram_main_keyboard())
+        return
+
+    if text_value == "💳 Монетизация":
+        await telegram_send_message(chat_id, "💳 Раздел подписок и оплаты готовится. Сейчас платные списания не подключены, поэтому ничего оплачивать не нужно.", telegram_main_keyboard())
+        return
+
+    if text_value == "📁 Мои файлы":
+        await telegram_send_message(chat_id, "📁 Хранилище файлов — следующий модуль. Пока файлы не сохраняются в личной библиотеке бота.", telegram_main_keyboard())
+        return
+
+    if text_value == "📊 Статистика":
+        since = int(time.time()) - (int(time.time()) % 86400)
+        with db_connect() as db:
+            total = db.execute("SELECT COUNT(*) AS n FROM telegram_uploads WHERE chat_id = ?", (str(chat_id),)).fetchone()["n"]
+            today = db.execute("SELECT COUNT(*) AS n FROM telegram_uploads WHERE chat_id = ? AND created_at >= ?", (str(chat_id), since)).fetchone()["n"]
+        await telegram_send_message(chat_id, f"📊 Ваша статистика\nУспешных отправок всего: {total}\nСегодня: {today}\nДневной лимит на старте: 5 видео.", telegram_main_keyboard())
+        return
+
+    # Accept an uploaded Telegram video/document and send it to the linked TikTok inbox.
+    video = message.get("video")
+    document = message.get("document")
+    file_id = None
+    content_type = None
+    file_size = 0
+    if video:
+        file_id = video.get("file_id")
+        content_type = video.get("mime_type") or "video/mp4"
+        file_size = video.get("file_size", 0)
+    elif document and (document.get("mime_type") or "").startswith("video/"):
+        file_id = document.get("file_id")
+        content_type = document.get("mime_type")
+        file_size = document.get("file_size", 0)
+
+    if file_id:
+        open_id = get_telegram_open_id(chat_id)
+        if not open_id:
+            await telegram_send_message(chat_id, "Сначала подключите TikTok через «Мои аккаунты» → «Добавить аккаунт».", telegram_main_keyboard())
+            return
+        if file_size and file_size > TELEGRAM_FILE_LIMIT:
+            await telegram_send_message(chat_id, "Файл больше 20 МБ. Пока Telegram не позволяет боту скачать такой файл. Загрузку больших видео через сайт добавим отдельно.", telegram_main_keyboard())
+            return
+        with db_connect() as db:
+            today_count = db.execute(
+                "SELECT COUNT(*) AS n FROM telegram_uploads WHERE chat_id = ? AND created_at >= ?",
+                (str(chat_id), int(time.time()) - (int(time.time()) % 86400)),
+            ).fetchone()["n"]
+        if today_count >= 5:
+            await telegram_send_message(chat_id, "На сегодня достигнут стартовый лимит — 5 видео. Попробуйте завтра.", telegram_main_keyboard())
+            return
+        try:
+            await telegram_send_message(chat_id, "⏳ Получаю видео и отправляю его в TikTok Inbox…")
+            content = await telegram_download_file(file_id)
+            publish_id = await upload_video_bytes(open_id, content, content_type)
+            with db_connect() as db:
+                db.execute(
+                    "INSERT INTO telegram_uploads (chat_id, created_at, publish_id) VALUES (?, ?, ?)",
+                    (str(chat_id), int(time.time()), publish_id),
+                )
+            await telegram_send_message(chat_id, "✅ Видео передано в TikTok Inbox. Откройте TikTok, найдите уведомление и завершите оформление и публикацию там.", telegram_main_keyboard())
+        except HTTPException as exc:
+            await telegram_send_message(chat_id, "Не удалось отправить видео в TikTok: " + str(exc.detail), telegram_main_keyboard())
+        except Exception as exc:
+            print(f"Telegram video upload error: {exc}")
+            await telegram_send_message(chat_id, "Не удалось обработать файл. Проверьте формат MP4, MOV или WEBM и попробуйте ещё раз.", telegram_main_keyboard())
+        return
+
+    if text_value in ("Instagram", "YouTube"):
+        await telegram_send_message(chat_id, f"{text_value} пока не подключён. Сейчас работает только TikTok; остальные платформы добавим позже.", telegram_accounts_keyboard())
+        return
+
+    await telegram_send_message(chat_id, "Выберите раздел с помощью кнопок меню.", telegram_main_keyboard())
+
+
+@app.post(TELEGRAM_WEBHOOK_PATH)
+async def telegram_webhook(request: Request):
+    if not TELEGRAM_BOT_TOKEN:
+        raise HTTPException(503, "Telegram bot is not configured")
+    update = await request.json()
+    message = update.get("message")
+    if message:
+        await handle_telegram_message(message)
     return {"ok": True}
