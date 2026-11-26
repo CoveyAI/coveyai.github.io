@@ -17,7 +17,7 @@ app.add_middleware(
     same_site="lax",
 )
 
-CLIENT_KEY = os.environ["TIKTOK_CLIENT_KEY"]
+CLIENT_KEY = os.environ["TIKTOK_CLIENT_KEY"].strip()
 CLIENT_SECRET = os.environ["TIKTOK_CLIENT_SECRET"]
 REDIRECT_URI = os.environ["TIKTOK_REDIRECT_URI"]
 
