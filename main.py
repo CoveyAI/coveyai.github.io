@@ -128,7 +128,7 @@ async def get_valid_token(open_id):
 
     result = response.json()
 
-    if result.get("error") != "ok":
+    if result.get("error", {}).get("code") != "ok":
         raise HTTPException(502, "TikTok rejected token refresh")
 
     data = result["data"]
