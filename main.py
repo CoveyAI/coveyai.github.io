@@ -2,36 +2,37 @@
 import os
 import secrets
 import sqlite3
+import math
 import time
-from pathlib import Path
-from urllib.parse import urlencode
+import html
 
 import httpx
-from fastapi import FastAPI, Request, UploadFile, File, Header, HTTPException
+from fastapi import FastAPI, Request, UploadFile, File, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from starlette.middleware.sessions import SessionMiddleware
 
-# ---------------- CONFIG ----------------
+# ============== SETTINGS ==============
 
 CLIENT_KEY = os.environ["TIKTOK_CLIENT_KEY"].strip()
 CLIENT_SECRET = os.environ["TIKTOK_CLIENT_SECRET"].strip()
 REDIRECT_URI = os.environ["TIKTOK_REDIRECT_URI"].strip()
 SESSION_SECRET = os.environ["SESSION_SECRET"]
-API_SECRET = os.environ["COVEYAI_API_SECRET"]
 
 DATABASE_PATH = os.getenv("DATABASE_PATH", "./coveyai.db")
 
-TIKTOK_TOKEN_URL = "https://open.tiktokapis.com/v2/oauth/token/"
-TIKTOK_UPLOAD_INIT = (
+AUTH_URL = "https://www.tiktok.com/v2/auth/authorize/"
+TOKEN_URL = "https://open.tiktokapis.com/v2/oauth/token/"
+UPLOAD_INIT_URL = (
     "https://open.tiktokapis.com/v2/post/publish/inbox/video/init/"
 )
-TIKTOK_STATUS_URL = (
+STATUS_URL = (
     "https://open.tiktokapis.com/v2/post/publish/status/fetch/"
 )
 
-MAX_VIDEO_SIZE = 64 * 1024 * 1024
+MAX_VIDEO_SIZE = 512 * 1024 * 1024
+CHUNK_SIZE = 64 * 1024 * 1024
 
-app = FastAPI(title="CoveyAI TikTok API")
+app = FastAPI(title="CoveyAI")
 
 app.add_middleware(
     SessionMiddleware,
@@ -40,19 +41,16 @@ app.add_middleware(
     same_site="lax",
 )
 
-# ---------------- DATABASE ----------------
+# ============== DATABASE ==============
 
-def get_db():
-    path = Path(DATABASE_PATH)
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    db = sqlite3.connect(str(path))
+def db_connect():
+    db = sqlite3.connect(DATABASE_PATH)
     db.row_factory = sqlite3.Row
     return db
 
 
 def init_db():
-    with get_db() as db:
+    with db_connect() as db:
         db.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 open_id TEXT PRIMARY KEY,
@@ -67,10 +65,10 @@ def init_db():
 init_db()
 
 
-def save_user(data):
+def save_tokens(data):
     now = int(time.time())
 
-    with get_db() as db:
+    with db_connect() as db:
         db.execute("""
             INSERT OR REPLACE INTO users
             (open_id, access_token, refresh_token,
@@ -86,76 +84,61 @@ def save_user(data):
 
 
 def get_user(open_id):
-    with get_db() as db:
+    with db_connect() as db:
         return db.execute(
             "SELECT * FROM users WHERE open_id = ?",
             (open_id,)
         ).fetchone()
 
 
-# ---------------- TOKEN MANAGEMENT ----------------
+# ============== ERROR HANDLING ==============
 
-async def get_valid_token(open_id):
-    user = get_user(open_id)
+def tiktok_error(result):
+    error = result.get("error", {})
 
-    if not user:
-        raise HTTPException(404, "TikTok account is not connected")
+    return {
+        "detail": "TikTok returned an error",
+        "tiktok_code": error.get("code", "unknown"),
+        "tiktok_message": error.get("message", ""),
+        "log_id": error.get("log_id") or result.get("log_id"),
+    }
 
-    now = int(time.time())
 
-    if user["expires_at"] > now + 300:
-        return user["access_token"]
-
-    if user["refresh_expires_at"] <= now:
+def check_tiktok_response(response):
+    try:
+        result = response.json()
+    except Exception:
         raise HTTPException(
-            401,
-            "TikTok authorization expired. Connect TikTok again."
-        )
-
-    async with httpx.AsyncClient(timeout=30) as client:
-        response = await client.post(
-            TIKTOK_TOKEN_URL,
-            data={
-                "client_key": CLIENT_KEY,
-                "client_secret": CLIENT_SECRET,
-                "grant_type": "refresh_token",
-                "refresh_token": user["refresh_token"],
-            },
+            502,
+            "TikTok returned an unreadable response"
         )
 
     if response.status_code != 200:
-        raise HTTPException(502, "TikTok token refresh failed")
-
-    result = response.json()
+        raise HTTPException(
+            502,
+            detail=tiktok_error(result)
+        )
 
     if result.get("error", {}).get("code") != "ok":
-        raise HTTPException(502, "TikTok rejected token refresh")
+        raise HTTPException(
+            400,
+            detail=tiktok_error(result)
+        )
 
-    data = result["data"]
-
-    save_user({
-        "open_id": open_id,
-        "access_token": data["access_token"],
-        "refresh_token": data["refresh_token"],
-        "expires_in": data["expires_in"],
-        "refresh_expires_in": data["refresh_expires_in"],
-    })
-
-    return data["access_token"]
+    return result.get("data", {})
 
 
-# ---------------- HOME ----------------
+# ============== HOME ==============
 
 @app.get("/")
 async def home():
     return HTMLResponse("""
     <html>
-    <head><title>CoveyAI</title></head>
     <body style="background:#101010;color:white;
     font-family:Arial;padding:40px">
         <h1>CoveyAI</h1>
         <p>TikTok integration</p>
-        <a href="/login" style="color:#aaa">
+        <a href="/login" style="color:white">
             Connect TikTok
         </a>
     </body>
@@ -165,10 +148,13 @@ async def home():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "CoveyAI"}
+    return {
+        "status": "ok",
+        "service": "CoveyAI"
+    }
 
 
-# ---------------- OAUTH LOGIN ----------------
+# ============== TIKTOK LOGIN ==============
 
 @app.get("/login")
 async def login(request: Request):
@@ -183,10 +169,9 @@ async def login(request: Request):
         "state": state,
     }
 
-    url = (
-        "https://www.tiktok.com/v2/auth/authorize/?"
-        + urlencode(params)
-    )
+    url = AUTH_URL + "?" + __import__(
+        "urllib.parse", fromlist=["urlencode"]
+    ).urlencode(params)
 
     return RedirectResponse(url)
 
@@ -196,24 +181,39 @@ async def callback(request: Request):
     error = request.query_params.get("error")
 
     if error:
-        return HTMLResponse(
-            "TikTok authorization was not completed.",
-            status_code=400,
+        description = request.query_params.get(
+            "error_description", "No details provided"
         )
+
+        return JSONResponse({
+            "detail": "TikTok authorization was not completed",
+            "tiktok_error": error,
+            "description": description,
+        }, status_code=400)
 
     code = request.query_params.get("code")
     state = request.query_params.get("state")
+
     saved_state = request.session.pop("oauth_state", None)
 
-    if not code or not state or not saved_state:
-        raise HTTPException(400, "Missing authorization data")
+    if not code:
+        return JSONResponse({
+            "detail": "TikTok did not return authorization code",
+            "received_parameters": list(request.query_params.keys()),
+        }, status_code=400)
+
+    if not state or not saved_state:
+        return JSONResponse({
+            "detail": "OAuth state is missing",
+            "hint": "Start authorization again using /login",
+        }, status_code=400)
 
     if not secrets.compare_digest(state, saved_state):
-        raise HTTPException(400, "Invalid OAuth state")
+        raise HTTPException(400, "OAuth state does not match")
 
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.post(
-            TIKTOK_TOKEN_URL,
+            TOKEN_URL,
             data={
                 "client_key": CLIENT_KEY,
                 "client_secret": CLIENT_SECRET,
@@ -223,24 +223,23 @@ async def callback(request: Request):
             },
         )
 
-    if response.status_code != 200:
-        raise HTTPException(502, "TikTok token request failed")
+    data = check_tiktok_response(response)
 
-    result = response.json()
+    required = [
+        "open_id",
+        "access_token",
+        "refresh_token",
+        "expires_in",
+        "refresh_expires_in",
+    ]
 
-    if result.get("error") != "ok":
-        raise HTTPException(400, "TikTok authorization error")
+    if any(key not in data for key in required):
+        raise HTTPException(
+            502,
+            "TikTok token response is incomplete"
+        )
 
-    data = result["data"]
-
-    save_user({
-        "open_id": data["open_id"],
-        "access_token": data["access_token"],
-        "refresh_token": data["refresh_token"],
-        "expires_in": data["expires_in"],
-        "refresh_expires_in": data["refresh_expires_in"],
-    })
-
+    save_tokens(data)
     request.session["tiktok_open_id"] = data["open_id"]
 
     return HTMLResponse("""
@@ -249,39 +248,80 @@ async def callback(request: Request):
     font-family:Arial;padding:40px">
         <h1>CoveyAI</h1>
         <h2>TikTok connected successfully!</h2>
-        <p>Your account is connected.</p>
+        <p>Your TikTok account is connected.</p>
         <p>You can close this page.</p>
     </body>
     </html>
     """)
 
 
-# ---------------- API SECURITY ----------------
+# ============== TOKEN REFRESH ==============
 
-def check_api_key(api_key):
-    if not api_key or not secrets.compare_digest(
-        api_key, API_SECRET
-    ):
-        raise HTTPException(401, "Invalid API key")
+async def get_access_token(open_id):
+    user = get_user(open_id)
+
+    if not user:
+        raise HTTPException(
+            401,
+            "TikTok account is not connected"
+        )
+
+    now = int(time.time())
+
+    if user["expires_at"] > now + 300:
+        return user["access_token"]
+
+    if user["refresh_expires_at"] <= now:
+        raise HTTPException(
+            401,
+            "TikTok authorization expired. Connect again."
+        )
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.post(
+            TOKEN_URL,
+            data={
+                "client_key": CLIENT_KEY,
+                "client_secret": CLIENT_SECRET,
+                "grant_type": "refresh_token",
+                "refresh_token": user["refresh_token"],
+            },
+        )
+
+    data = check_tiktok_response(response)
+
+    data["open_id"] = open_id
+    save_tokens(data)
+
+    return data["access_token"]
 
 
-# ---------------- VIDEO UPLOAD ----------------
+# ============== VIDEO UPLOAD ==============
 
 @app.post("/upload")
 async def upload_video(
-    open_id: str,
+    request: Request,
     file: UploadFile = File(...),
-    x_api_key: str = Header(None),
 ):
-    check_api_key(x_api_key)
+    open_id = request.session.get("tiktok_open_id")
 
-    if file.content_type not in (
+    if not open_id:
+        raise HTTPException(
+            401,
+            "Connect TikTok first using /login"
+        )
+
+    allowed_types = {
         "video/mp4",
         "video/quicktime",
         "video/webm",
-        "application/octet-stream",
-    ):
-        raise HTTPException(400, "Unsupported video format")
+    }
+
+    if file.content_type not in allowed_types:
+        raise HTTPException(
+            400,
+            "Supported formats: MP4, MOV, WEBM"
+        )
 
     video = await file.read(MAX_VIDEO_SIZE + 1)
 
@@ -291,116 +331,109 @@ async def upload_video(
     if len(video) > MAX_VIDEO_SIZE:
         raise HTTPException(
             413,
-            "Video is too large. Maximum size is 64 MB."
+            "Maximum video size is 512 MB"
         )
 
-    if not video.startswith(b"\x00\x00\x00") and not (
-        video.startswith(b"\x1a\x45\xdf\xa3")
-    ):
-        raise HTTPException(
-            400,
-            "File does not appear to be a supported video."
-        )
-
-    token = await get_valid_token(open_id)
     video_size = len(video)
+    chunk_size = min(CHUNK_SIZE, video_size)
+    total_chunks = math.ceil(video_size / chunk_size)
 
-    async with httpx.AsyncClient(timeout=120) as client:
+    token = await get_access_token(open_id)
+
+    async with httpx.AsyncClient(timeout=180) as client:
+
         init_response = await client.post(
-            TIKTOK_UPLOAD_INIT,
+            UPLOAD_INIT_URL,
             headers={
                 "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
+                "Content-Type": "application/json; charset=UTF-8",
             },
             json={
                 "source_info": {
                     "source": "FILE_UPLOAD",
                     "video_size": video_size,
-                    "chunk_size": video_size,
-                    "total_chunk_count": 1,
+                    "chunk_size": chunk_size,
+                    "total_chunk_count": total_chunks,
                 }
             },
         )
 
-        if init_response.status_code != 200:
+        upload_data = check_tiktok_response(init_response)
+
+        upload_url = upload_data.get("upload_url")
+        publish_id = upload_data.get("publish_id")
+
+        if not upload_url or not publish_id:
             raise HTTPException(
                 502,
-                "TikTok upload initialization failed"
+                "TikTok did not return upload information"
             )
 
-        init_data = init_response.json()
+        for index in range(total_chunks):
+            start = index * chunk_size
+            end = min(start + chunk_size, video_size)
+            chunk = video[start:end]
 
-        if init_data.get("error", {}).get("code") != "ok":
-            raise HTTPException(
-                400,
-                "TikTok: " + init_data.get("error", {}).get(
-                    "message", "Upload initialization error"
+            upload_response = await client.put(
+                upload_url,
+                content=chunk,
+                headers={
+                    "Content-Type": file.content_type,
+                    "Content-Length": str(len(chunk)),
+                    "Content-Range": (
+                        f"bytes {start}-{end - 1}/{video_size}"
+                    ),
+                },
+            )
+
+            if upload_response.status_code not in (200, 201, 206):
+                raise HTTPException(
+                    502,
+                    "TikTok video transfer failed"
                 )
-            )
-
-        upload_info = init_data["data"]
-        upload_url = upload_info["upload_url"]
-
-        upload_response = await client.put(
-            upload_url,
-            content=video,
-            headers={
-                "Content-Type": file.content_type
-                if file.content_type != "application/octet-stream"
-                else "video/mp4",
-                "Content-Length": str(video_size),
-                "Content-Range": f"bytes 0-{video_size - 1}/{video_size}",
-            },
-        )
-
-        if upload_response.status_code not in (200, 201, 206):
-            raise HTTPException(
-                502,
-                "TikTok video transfer failed"
-            )
 
     return {
         "success": True,
+        "publish_id": publish_id,
         "message": (
-            "Video uploaded to TikTok inbox. "
-            "The creator must open TikTok and finish posting."
+            "Video sent to TikTok inbox. "
+            "Open TikTok to edit and finish posting."
         ),
-        "publish_id": upload_info["publish_id"],
     }
 
 
-# ---------------- UPLOAD STATUS ----------------
+# ============== UPLOAD STATUS ==============
 
 @app.post("/upload/status")
 async def upload_status(
+    request: Request,
     publish_id: str,
-    open_id: str,
-    x_api_key: str = Header(None),
 ):
-    check_api_key(x_api_key)
+    open_id = request.session.get("tiktok_open_id")
 
-    token = await get_valid_token(open_id)
+    if not open_id:
+        raise HTTPException(
+            401,
+            "Connect TikTok first"
+        )
+
+    token = await get_access_token(open_id)
 
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.post(
-            TIKTOK_STATUS_URL,
+            STATUS_URL,
             headers={
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
             },
-            json={"publish_id": publish_id},
+            json={
+                "publish_id": publish_id
+            },
         )
 
-    if response.status_code != 200:
-        raise HTTPException(502, "Status request failed")
+    data = check_tiktok_response(response)
 
-    result = response.json()
-
-    if result.get("error", {}).get("code") != "ok":
-        raise HTTPException(400, "TikTok status error")
-
-    return result
-
-
-# ---------------- END ----------------
-
+    return {
+        "success": True,
+        "data": data
+    }
