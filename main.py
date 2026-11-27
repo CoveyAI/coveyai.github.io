@@ -21,8 +21,8 @@ SESSION_SECRET = os.environ["SESSION_SECRET"]
 
 DATABASE_PATH = os.getenv("DATABASE_PATH", "./coveyai.db")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "").strip()
-PEXELS_SEARCH_URL = "https://api.pexels.com/videos/search"
+PIXABAY_API_KEY = os.getenv("PIXABAY_API_KEY", "").strip()
+PIXABAY_SEARCH_URL = "https://pixabay.com/api/videos/"
 PUBLIC_BASE_URL = os.getenv(
     "PUBLIC_BASE_URL", "https://coveyai-github-io.onrender.com"
 ).rstrip("/")
@@ -234,7 +234,7 @@ async def health():
         "status": "ok",
         "service": "CoveyAI",
         "telegram_configured": bool(TELEGRAM_BOT_TOKEN),
-        "pexels_configured": bool(PEXELS_API_KEY),
+        "pixabay_configured": bool(PIXABAY_API_KEY),
     }
 
 
@@ -616,31 +616,47 @@ def is_search_waiting(chat_id):
     return bool(row and row["waiting_for_query"])
 
 
-async def search_pexels_videos(query):
-    if not PEXELS_API_KEY:
-        raise RuntimeError("Pexels API key is not configured on the server")
+async def search_pixabay_videos(query):
+    if not PIXABAY_API_KEY:
+        raise RuntimeError("Pixabay API key is not configured on the server (PIXABAY_API_KEY).")
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.get(
-            PEXELS_SEARCH_URL,
-            headers={"Authorization": PEXELS_API_KEY},
-            params={"query": query, "per_page": 5, "orientation": "portrait"},
+            PIXABAY_SEARCH_URL,
+            params={
+                "key": PIXABAY_API_KEY,
+                "q": query,
+                "per_page": 5,
+                "safesearch": "true",
+                "video_type": "all",
+            },
         )
-    if response.status_code == 401:
-        raise RuntimeError("Pexels не принял API-ключ. Проверьте PEXELS_API_KEY в Render.")
+    if response.status_code == 400:
+        raise RuntimeError("Pixabay отклонил параметры поиска. Проверьте запрос и настройки API.")
     if response.status_code == 429:
-        raise RuntimeError("Pexels временно ограничил частоту запросов. Попробуйте немного позже.")
+        raise RuntimeError("Pixabay временно ограничил частоту запросов. Попробуйте позже.")
+    if response.status_code == 401 or response.status_code == 403:
+        raise RuntimeError("Pixabay не принял API-ключ. Проверьте PIXABAY_API_KEY в Render.")
     if response.status_code != 200:
-        raise RuntimeError(f"Pexels вернул ошибку поиска (HTTP {response.status_code}).")
-    return response.json().get("videos", [])
+        raise RuntimeError(f"Pixabay вернул ошибку поиска (HTTP {response.status_code}).")
+    payload = response.json()
+    if payload.get("totalHits", 0) == 0:
+        return []
+    return payload.get("hits", [])
 
 
-def choose_pexels_video_file(video):
-    files = [f for f in video.get("video_files", []) if f.get("file_type") == "video/mp4" and f.get("link")]
-    if not files:
-        return None
-    # Prefer a moderate-size HD/SD MP4 to make Telegram preview more reliable.
-    files.sort(key=lambda f: (0 if f.get("quality") == "sd" else 1, f.get("width") or 99999))
-    return files[0]["link"]
+def choose_pixabay_video_file(video):
+    variants = video.get("videos") or {}
+    # Prefer medium/small MP4 for reliable Telegram previews and reasonable size.
+    for quality in ("medium", "small", "large", "tiny"):
+        item = variants.get(quality) or {}
+        url = item.get("url")
+        if url and url.lower().split("?")[0].endswith(".mp4"):
+            return url
+    for item in variants.values():
+        url = item.get("url") if isinstance(item, dict) else None
+        if url and url.lower().split("?")[0].endswith(".mp4"):
+            return url
+    return None
 
 
 async def telegram_set_webhook():
@@ -768,11 +784,11 @@ async def handle_telegram_message(message):
         return
 
     if text_value == "🔎 Найти видео":
-        if not PEXELS_API_KEY:
-            await telegram_send_message(chat_id, "Для поиска нужно добавить PEXELS_API_KEY в Environment на Render. Сам ключ в чат не отправляйте.", telegram_main_keyboard())
+        if not PIXABAY_API_KEY:
+            await telegram_send_message(chat_id, "Для поиска нужно добавить PIXABAY_API_KEY в Environment на Render. Сам ключ в чат не отправляйте.", telegram_main_keyboard())
             return
         set_search_waiting(chat_id, True)
-        await telegram_send_message(chat_id, "🔎 Напишите тему для поиска видео на Pexels. Например: nature, city, travel, cats. Будут показаны ролики из библиотеки Pexels с ссылкой на источник.", telegram_main_keyboard())
+        await telegram_send_message(chat_id, "🔎 Напишите тему для поиска видео на Pixabay. Например: nature, city, travel, cats. Будут показаны ролики из библиотеки Pixabay с ссылкой на источник.", telegram_main_keyboard())
         return
 
     if text_value == "✨ Обработать видео":
@@ -855,27 +871,27 @@ async def handle_telegram_message(message):
         set_search_waiting(chat_id, False)
         try:
             await telegram_send_message(chat_id, f"🔎 Ищу видео по запросу: {query}…")
-            videos = await search_pexels_videos(query)
+            videos = await search_pixabay_videos(query)
             if not videos:
                 await telegram_send_message(chat_id, "По этому запросу видео не нашлись. Попробуйте другие ключевые слова.", telegram_main_keyboard())
                 return
-            await telegram_send_message(chat_id, f"Нашёл {len(videos)} видео на Pexels. Ниже — предпросмотр и ссылка на страницу каждого ролика.")
+            await telegram_send_message(chat_id, f"Нашёл {len(videos)} видео на Pixabay. Ниже — предпросмотр и ссылка на страницу каждого ролика.")
             for index, item in enumerate(videos, start=1):
                 title = f"Видео {index} · {item.get('duration', '?')} сек. · {item.get('width', '?')}×{item.get('height', '?')}"
-                source_url = item.get("url", "")
-                preview_url = choose_pexels_video_file(item)
-                photographer = item.get("user", {}).get("name", "Автор Pexels")
+                source_url = item.get("pageURL", "")
+                preview_url = choose_pixabay_video_file(item)
+                photographer = item.get("user", "Автор Pixabay")
                 if preview_url:
                     try:
                         await telegram_send_video(chat_id, preview_url, f"{title}\nАвтор: {photographer}\nИсточник: {source_url}")
                     except Exception as preview_error:
-                        print(f"Pexels preview send failed: {preview_error}")
+                        print(f"Pixabay preview send failed: {preview_error}")
                         await telegram_send_message(chat_id, f"{title}\nАвтор: {photographer}\nОткрыть видео: {source_url}")
                 else:
                     await telegram_send_message(chat_id, f"{title}\nАвтор: {photographer}\nОткрыть видео: {source_url}")
-            await telegram_send_message(chat_id, "Выберите понравившийся ролик на Pexels и убедитесь, что условия лицензии подходят для вашего использования. На следующем этапе добавим сохранение выбранного ролика в «Мои файлы» и передачу в обработку.", telegram_main_keyboard())
+            await telegram_send_message(chat_id, "Выберите понравившийся ролик на Pixabay и убедитесь, что условия лицензии подходят для вашего использования. На следующем этапе добавим сохранение выбранного ролика в «Мои файлы» и передачу в обработку.", telegram_main_keyboard())
         except Exception as exc:
-            print(f"Pexels search error: {exc}")
+            print(f"Pixabay search error: {exc}")
             await telegram_send_message(chat_id, "Не удалось выполнить поиск: " + str(exc), telegram_main_keyboard())
         return
 
