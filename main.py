@@ -264,7 +264,8 @@ async def health():
         "media_library": "telegram_file_ids_and_sqlite",
         "video_processing": "ffmpeg_vertical_mp4",
         "publishing": "tiktok_inbox",
-        "direct_media_url_hosts_configured": bool(MEDIA_URL_ALLOWED_HOSTS),
+        "direct_media_url_hosts_available": bool(MEDIA_URL_ALLOWED_HOSTS),
+        "custom_media_url_hosts_configured": bool(CUSTOM_MEDIA_URL_ALLOWED_HOSTS),
         "publish_job_mode": "background_with_status_messages",
     }
 
@@ -571,8 +572,18 @@ MAX_PROCESS_SECONDS = 180
 DAILY_UPLOAD_LIMIT = 5
 # Optional HTTPS hosts that may serve user-owned/licensed direct video files.
 # Example Render Environment value: media.example.com,cdn.example.com
-MEDIA_URL_ALLOWED_HOSTS = {
-    item.strip().lower().lstrip(".")
+# Public file hosts commonly used for videos that the bot owner/user has permission
+# to process. Add any additional domain you own/control in Render Environment:
+# MEDIA_URL_ALLOWED_HOSTS="media.example.com,cdn.example.com"
+# TikTok post-page URLs are deliberately NOT treated as downloadable media URLs.
+DEFAULT_MEDIA_URL_ALLOWED_HOSTS = {
+    "storage.googleapis.com",
+    "dl.dropboxusercontent.com",
+    "res.cloudinary.com",
+    "firebasestorage.googleapis.com",
+}
+MEDIA_URL_ALLOWED_HOSTS = DEFAULT_MEDIA_URL_ALLOWED_HOSTS | {
+    item.strip().lower().lstrip(".").rstrip(".")
     for item in os.getenv("MEDIA_URL_ALLOWED_HOSTS", "").split(",")
     if item.strip()
 }
@@ -651,6 +662,30 @@ async def telegram_send_video_bytes(chat_id, video_bytes, caption=None):
         raise RuntimeError("Telegram вернул нечитаемый ответ при отправке готового видео")
     if response.status_code != 200 or not result.get("ok"):
         raise RuntimeError(result.get("description", "Не удалось отправить готовое видео в Telegram"))
+    return result.get("result") or {}
+
+
+async def telegram_send_document_bytes(chat_id, file_bytes, filename, content_type, caption=None):
+    """Save original source as a Telegram document to preserve MOV/WEBM/MP4 bytes."""
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("Telegram bot is not configured")
+    if len(file_bytes) > TELEGRAM_MAX_VIDEO_BYTES:
+        raise RuntimeError("Исходный файл больше 20 МБ. Для этой версии нужен файл до 20 МБ.")
+    data = {"chat_id": str(chat_id)}
+    if caption:
+        data["caption"] = caption[:900]
+    async with httpx.AsyncClient(timeout=180) as client:
+        response = await client.post(
+            f"{TG_API.format(TELEGRAM_BOT_TOKEN)}/sendDocument",
+            data=data,
+            files={"document": (filename, file_bytes, content_type)},
+        )
+    try:
+        result = response.json()
+    except Exception:
+        raise RuntimeError("Telegram вернул нечитаемый ответ при сохранении исходного файла")
+    if response.status_code != 200 or not result.get("ok"):
+        raise RuntimeError(result.get("description", "Не удалось сохранить исходный видеофайл в Telegram"))
     return result.get("result") or {}
 
 
@@ -748,7 +783,10 @@ def is_allowed_media_url(value):
                    for allowed in MEDIA_URL_ALLOWED_HOSTS):
             return False
         path = parsed.path.lower()
-        return path.endswith((".mp4", ".mov", ".webm"))
+        # Accept only direct video files. A web page/player URL is not a media file.
+        if not path.endswith((".mp4", ".mov", ".webm")):
+            return False
+        return True
     except (ValueError, TypeError):
         return False
 
@@ -757,8 +795,11 @@ async def download_authorized_media_url(url):
     """Download a direct video file from a user-configured trusted HTTPS host."""
     if not is_allowed_media_url(url):
         raise RuntimeError(
-            "Эта ссылка не является прямой ссылкой MP4/MOV/WEBM с разрешённого домена. "
-            "TikTok-ссылка подходит для выбора ролика, но не является исходным файлом."
+            "Это не прямая ссылка на видеофайл с разрешённого HTTPS-домена. "
+            "Ссылка вида tiktok.com/@user/video/... открывает страницу, а не MP4-файл. "
+            "Для обработки отправьте прямую ссылку на свой MP4/MOV/WEBM из Google Cloud Storage, "
+            "Dropbox direct download, Cloudinary, Firebase Storage или собственного домена "
+            "(его можно добавить в MEDIA_URL_ALLOWED_HOSTS на Render)."
         )
 
     chunks = []
@@ -796,12 +837,21 @@ async def save_media_from_direct_url(chat_id, url):
     video_bytes = await download_authorized_media_url(url)
     workflow = get_workflow(chat_id)
     source_url = workflow["source_url"] if workflow else url
-    sent = await telegram_send_video_bytes(
+    suffix = Path(urlparse(url).path).suffix.lower()
+    file_types = {
+        ".mp4": ("video/mp4", "coveyai_source.mp4"),
+        ".mov": ("video/quicktime", "coveyai_source.mov"),
+        ".webm": ("video/webm", "coveyai_source.webm"),
+    }
+    content_type, filename = file_types.get(suffix, ("application/octet-stream", "coveyai_source.bin"))
+    sent = await telegram_send_document_bytes(
         chat_id,
         video_bytes,
-        "✅ Видео по ссылке получено. Проверьте, что это ваш ролик или материал с разрешением. Теперь нажмите «✨ Обработать видео»."
+        filename,
+        content_type,
+        "✅ Исходный видеофайл получен. Проверьте, что это ваш ролик или материал с разрешением. Теперь нажмите «✨ Обработать видео»."
     )
-    sent_video = sent.get("video") or sent.get("document") or {}
+    sent_video = sent.get("document") or sent.get("video") or {}
     file_id = sent_video.get("file_id")
     if not file_id:
         raise RuntimeError("Telegram не вернул file_id полученного видео.")
@@ -842,6 +892,18 @@ def save_media_file(chat_id, file_id, file_size, source_url=None):
         media_id = cursor.lastrowid
     set_workflow(chat_id, "ready_process", source_url=source_url, media_id=media_id)
     return media_id
+
+
+async def receive_direct_media_url_job(chat_id, url):
+    try:
+        await save_media_from_direct_url(chat_id, url)
+    except Exception as exc:
+        print(f"Direct media URL error for chat {chat_id}: {exc}")
+        await telegram_send_message(
+            chat_id,
+            "Не удалось получить видео по прямой ссылке: " + str(exc),
+            telegram_main_keyboard(),
+        )
 
 
 async def telegram_set_webhook():
@@ -1225,7 +1287,7 @@ async def handle_telegram_message(message):
             set_workflow(chat_id, "waiting_video_file", source_url=text_value)
             await telegram_send_message(
                 chat_id,
-                "✅ Ссылка TikTok сохранена как ссылка на выбранный ролик.\n\nЧтобы обработать его по ссылке, отправьте прямой HTTPS-адрес MP4/MOV/WEBM с домена, добавленного в MEDIA_URL_ALLOWED_HOSTS на Render. Обычная ссылка страницы TikTok не является ссылкой на MP4. Также можно отправить свой исходный файл в Telegram. Используйте только свои или разрешённые материалы.",
+                "✅ Ссылка TikTok сохранена как ссылка на выбранный ролик.\n\nЧтобы обработать видео по ссылке, пришлите прямой HTTPS-адрес самого файла (.mp4, .mov или .webm) из вашего хранилища. Поддерживаются прямые файлы из Google Cloud Storage, Dropbox direct download, Cloudinary и Firebase Storage. Для собственного домена добавьте его в MEDIA_URL_ALLOWED_HOSTS на Render. Обычная ссылка страницы TikTok не является видеофайлом: официальный Display API возвращает сведения и embed-представление, но не исходный MP4. Используйте только свои видео или материалы с разрешением.",
                 telegram_main_keyboard(),
             )
         elif is_allowed_media_url(text_value):
@@ -1237,7 +1299,7 @@ async def handle_telegram_message(message):
         else:
             await telegram_send_message(
                 chat_id,
-                "Я принимаю ссылки на отдельные ролики TikTok как ссылки для выбора, а для загрузки исходника — только прямые HTTPS-ссылки MP4/MOV/WEBM с домена, разрешённого в MEDIA_URL_ALLOWED_HOSTS. Можно также отправить исходный файл в Telegram.",
+                "Это не прямая ссылка на видеофайл. Принимаются HTTPS-ссылки, заканчивающиеся на .mp4, .mov или .webm, с Google Cloud Storage, Dropbox direct download, Cloudinary, Firebase Storage либо домена из MEDIA_URL_ALLOWED_HOSTS. TikTok-ссылка сохраняется как ссылка для выбора, но не является исходным видеофайлом. Можно также отправить свой исходный файл в Telegram.",
                 telegram_main_keyboard(),
             )
         return
@@ -1334,6 +1396,9 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
         elif chat_id and text_value == "🚀 Опубликовать видео":
             # TikTok upload runs after the webhook acknowledgement; the job sends start and final messages.
             background_tasks.add_task(publish_latest_processed_video, chat_id, True)
+        elif chat_id and is_allowed_media_url(text_value):
+            # Fetch remote source in a background task to keep Telegram webhook responsive.
+            background_tasks.add_task(receive_direct_media_url_job, chat_id, text_value)
         else:
             await handle_telegram_message(message)
     return {"ok": True}
