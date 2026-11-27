@@ -5,10 +5,16 @@ import math
 import time
 import html
 import hashlib
-from urllib.parse import quote_plus
+import re
+import asyncio
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
+from urllib.parse import quote_plus, urlparse
 
 import httpx
-from fastapi import FastAPI, Request, UploadFile, File, HTTPException
+from fastapi import FastAPI, Request, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from starlette.middleware.sessions import SessionMiddleware
 
@@ -98,6 +104,31 @@ def init_db():
                 waiting_for_query INTEGER NOT NULL DEFAULT 0
             )
         """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS bot_workflows (
+                chat_id TEXT PRIMARY KEY,
+                stage TEXT NOT NULL,
+                source_url TEXT,
+                media_id INTEGER,
+                updated_at INTEGER NOT NULL
+            )
+        """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS media_files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id TEXT NOT NULL,
+                source_url TEXT,
+                original_file_id TEXT NOT NULL,
+                processed_file_id TEXT,
+                original_size INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'uploaded',
+                created_at INTEGER NOT NULL,
+                processed_at INTEGER,
+                published_at INTEGER,
+                publish_id TEXT
+            )
+        """)
+        db.execute("CREATE INDEX IF NOT EXISTS idx_media_chat_created ON media_files(chat_id, created_at DESC)")
 
 
 init_db()
@@ -230,6 +261,9 @@ async def health():
         "service": "CoveyAI",
         "telegram_configured": bool(TELEGRAM_BOT_TOKEN),
         "tiktok_search_mode": "search_link",
+        "media_library": "telegram_file_ids_and_sqlite",
+        "video_processing": "ffmpeg_vertical_mp4",
+        "publishing": "tiktok_inbox",
     }
 
 
@@ -530,6 +564,9 @@ async def upload_status(
 TG_API = "https://api.telegram.org/bot{}"
 SITE_URL = "https://coveyai.github.io/"
 TIKTOK_SEARCH_URL = "https://www.tiktok.com/search?q={}"
+TELEGRAM_MAX_VIDEO_BYTES = 20 * 1024 * 1024
+MAX_PROCESS_SECONDS = 180
+DAILY_UPLOAD_LIMIT = 5
 
 
 def telegram_main_keyboard():
@@ -537,9 +574,9 @@ def telegram_main_keyboard():
         "keyboard": [
             [{"text": "🔎 Найти видео"}, {"text": "🔥 TikTok тренды"}],
             [{"text": "✨ Обработать видео"}, {"text": "🚀 Опубликовать видео"}],
-            [{"text": "💳 Монетизация"}],
             [{"text": "📁 Мои файлы"}, {"text": "📊 Статистика"}],
             [{"text": "👤 Мои аккаунты"}, {"text": "📱 Наше приложение"}],
+            [{"text": "💳 Монетизация"}],
         ],
         "resize_keyboard": True,
         "is_persistent": True,
@@ -550,8 +587,9 @@ def telegram_accounts_keyboard():
     return {
         "keyboard": [
             [{"text": "➕ Добавить аккаунт"}, {"text": "👁 Мои аккаунты"}],
-            [{"text": "TikTok"}, {"text": "Instagram"}],
-            [{"text": "YouTube"}, {"text": "⬅️ Главное меню"}],
+            [{"text": "TikTok"}],
+            [{"text": "Instagram"}, {"text": "YouTube"}],
+            [{"text": "⬅️ Главное меню"}],
         ],
         "resize_keyboard": True,
         "is_persistent": True,
@@ -561,7 +599,7 @@ def telegram_accounts_keyboard():
 async def telegram_api(method, payload=None):
     if not TELEGRAM_BOT_TOKEN:
         return None
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=40) as client:
         response = await client.post(
             f"{TG_API.format(TELEGRAM_BOT_TOKEN)}/{method}",
             json=payload or {},
@@ -578,19 +616,33 @@ async def telegram_api(method, payload=None):
 async def telegram_send_message(chat_id, text, reply_markup=None):
     if not TELEGRAM_BOT_TOKEN:
         return
-    payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
+    payload = {"chat_id": chat_id, "text": str(text), "disable_web_page_preview": True}
     if reply_markup:
         payload["reply_markup"] = reply_markup
     await telegram_api("sendMessage", payload)
 
 
-async def telegram_send_video(chat_id, video_url, caption=None):
+async def telegram_send_video_bytes(chat_id, video_bytes, caption=None):
     if not TELEGRAM_BOT_TOKEN:
-        return
-    payload = {"chat_id": chat_id, "video": video_url}
+        raise RuntimeError("Telegram bot is not configured")
+    if len(video_bytes) > TELEGRAM_MAX_VIDEO_BYTES:
+        raise RuntimeError("Готовый файл больше 20 МБ. Отправьте более короткое или компактное видео.")
+    data = {"chat_id": str(chat_id)}
     if caption:
-        payload["caption"] = caption[:900]
-    await telegram_api("sendVideo", payload)
+        data["caption"] = caption[:900]
+    async with httpx.AsyncClient(timeout=180) as client:
+        response = await client.post(
+            f"{TG_API.format(TELEGRAM_BOT_TOKEN)}/sendVideo",
+            data=data,
+            files={"video": ("coveyai_processed.mp4", video_bytes, "video/mp4")},
+        )
+    try:
+        result = response.json()
+    except Exception:
+        raise RuntimeError("Telegram вернул нечитаемый ответ при отправке готового видео")
+    if response.status_code != 200 or not result.get("ok"):
+        raise RuntimeError(result.get("description", "Не удалось отправить готовое видео в Telegram"))
+    return result.get("result") or {}
 
 
 def set_search_waiting(chat_id, waiting):
@@ -613,30 +665,97 @@ def is_search_waiting(chat_id):
     return bool(row and row["waiting_for_query"])
 
 
+def set_workflow(chat_id, stage, source_url=None, media_id=None):
+    with db_connect() as db:
+        db.execute(
+            """INSERT OR REPLACE INTO bot_workflows
+               (chat_id, stage, source_url, media_id, updated_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (str(chat_id), stage, source_url, media_id, int(time.time())),
+        )
+
+
+def get_workflow(chat_id):
+    with db_connect() as db:
+        return db.execute(
+            "SELECT * FROM bot_workflows WHERE chat_id = ?",
+            (str(chat_id),),
+        ).fetchone()
+
+
+def clear_workflow(chat_id):
+    with db_connect() as db:
+        db.execute("DELETE FROM bot_workflows WHERE chat_id = ?", (str(chat_id),))
+    set_search_waiting(chat_id, False)
+
+
 def make_tiktok_search_url(query):
-    """Create a TikTok search URL for a user-entered topic."""
-    safe_query = quote_plus(query.strip())
-    return TIKTOK_SEARCH_URL.format(safe_query)
+    return TIKTOK_SEARCH_URL.format(quote_plus(query.strip()))
 
 
 async def send_tiktok_search(chat_id, query):
-    query = query.strip()[:100]
+    query = (query or "").strip()[:100]
     if not query:
-        await telegram_send_message(
-            chat_id,
-            "Напишите тему для поиска. Например: футбол, машины, животные.",
-            telegram_main_keyboard(),
-        )
+        await telegram_send_message(chat_id, "Напишите тему для поиска, например: футбол или машины.", telegram_main_keyboard())
         return
-
     search_url = make_tiktok_search_url(query)
+    set_workflow(chat_id, "waiting_tiktok_link")
     await telegram_send_message(
         chat_id,
         f"🔎 Поиск TikTok по запросу: {query}\n\n"
-        f"Откройте результаты поиска:\n{search_url}\n\n"
-        "Это ссылка на поиск внутри TikTok. Бот пока не получает автоматически список роликов и не скачивает их.",
+        f"Откройте результаты поиска и выберите понравившийся ролик:\n{search_url}\n\n"
+        "Затем отправьте сюда ссылку на конкретный ролик. После этого бот попросит загрузить ваш исходный видеофайл или материал, на который у вас есть разрешение. По одной ссылке бот не скачивает чужое видео.",
         telegram_main_keyboard(),
     )
+
+
+def is_tiktok_video_url(value):
+    """Accept TikTok post URLs and TikTok short links; do not fetch the URL."""
+    try:
+        parsed = urlparse(value.strip())
+        host = (parsed.hostname or "").lower()
+        allowed = (
+            host == "tiktok.com"
+            or host.endswith(".tiktok.com")
+        )
+        if parsed.scheme not in ("http", "https") or not allowed:
+            return False
+        path = parsed.path.lower()
+        return ("/video/" in path) or host in {"vm.tiktok.com", "vt.tiktok.com"}
+    except Exception:
+        return False
+
+
+def get_media(chat_id, media_id):
+    with db_connect() as db:
+        return db.execute(
+            "SELECT * FROM media_files WHERE id = ? AND chat_id = ?",
+            (int(media_id), str(chat_id)),
+        ).fetchone()
+
+
+def get_latest_media(chat_id, needs_processing=False):
+    query = "SELECT * FROM media_files WHERE chat_id = ?"
+    args = [str(chat_id)]
+    if needs_processing:
+        query += " AND processed_file_id IS NULL"
+    query += " ORDER BY id DESC LIMIT 1"
+    with db_connect() as db:
+        return db.execute(query, args).fetchone()
+
+
+def save_media_file(chat_id, file_id, file_size, source_url=None):
+    now = int(time.time())
+    with db_connect() as db:
+        cursor = db.execute(
+            """INSERT INTO media_files
+               (chat_id, source_url, original_file_id, original_size, status, created_at)
+               VALUES (?, ?, ?, ?, 'uploaded', ?)""",
+            (str(chat_id), source_url, file_id, int(file_size or 0), now),
+        )
+        media_id = cursor.lastrowid
+    set_workflow(chat_id, "ready_process", source_url=source_url, media_id=media_id)
+    return media_id
 
 
 async def telegram_set_webhook():
@@ -695,16 +814,252 @@ async def telegram_download_file(file_id):
     if not file_path:
         raise RuntimeError("Telegram не вернул файл")
     file_size = info.get("file_size", 0)
-    if file_size and file_size > TELEGRAM_FILE_LIMIT:
-        raise RuntimeError("Через Telegram можно отправить видео размером до 20 МБ. Большие файлы добавим через сайт.")
+    if file_size and file_size > TELEGRAM_MAX_VIDEO_BYTES:
+        raise RuntimeError("Через текущий Telegram Bot API можно скачать видео размером до 20 МБ.")
     url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
-    async with httpx.AsyncClient(timeout=90) as client:
+    async with httpx.AsyncClient(timeout=120) as client:
         response = await client.get(url)
     if response.status_code != 200:
         raise RuntimeError("Не удалось скачать видео из Telegram")
-    if len(response.content) > TELEGRAM_FILE_LIMIT:
-        raise RuntimeError("Видео превышает лимит Telegram 20 МБ")
+    if len(response.content) > TELEGRAM_MAX_VIDEO_BYTES:
+        raise RuntimeError("Видео превышает лимит 20 МБ")
     return response.content
+
+
+def find_ffmpeg():
+    try:
+        import imageio_ffmpeg  # provided by requirements.txt
+        path = imageio_ffmpeg.get_ffmpeg_exe()
+        if path and Path(path).exists():
+            return path
+    except Exception:
+        pass
+    return shutil.which("ffmpeg")
+
+
+def transcode_video(video_bytes):
+    """Prepare an owned/licensed clip for TikTok: vertical canvas and MP4 re-encode.
+
+    This deliberately does not remove logos/watermarks or disguise ownership.
+    The full frame is preserved and padded rather than cropped.
+    """
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg:
+        raise RuntimeError("На сервере не найден FFmpeg. Установите зависимости из нового requirements.txt и выполните Deploy.")
+
+    with tempfile.TemporaryDirectory(prefix="coveyai_") as temp_dir:
+        input_path = Path(temp_dir) / "input_video"
+        output_path = Path(temp_dir) / "processed.mp4"
+        input_path.write_bytes(video_bytes)
+
+        base_args = [
+            ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+            "-i", str(input_path),
+            "-map", "0:v:0", "-map", "0:a?",
+            "-vf", "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=30,eq=contrast=1.03:saturation=1.04",
+            "-c:v", "libx264", "-preset", "veryfast",
+            "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "96k",
+            "-movflags", "+faststart", "-threads", "2", str(output_path),
+        ]
+
+        # First pass. If the output is too large for Telegram, reduce bitrate once.
+        first = base_args[:-1] + ["-b:v", "1400k", "-maxrate", "1400k", "-bufsize", "2800k", base_args[-1]]
+        result = subprocess.run(first, capture_output=True, text=True, timeout=240)
+        if result.returncode != 0:
+            detail = (result.stderr or "FFmpeg failed")[-900:]
+            raise RuntimeError("Не удалось обработать видео. Проверьте, что файл действительно является видео MP4/MOV/WEBM. " + detail)
+
+        if not output_path.exists():
+            raise RuntimeError("FFmpeg не создал готовый файл")
+        if output_path.stat().st_size > TELEGRAM_MAX_VIDEO_BYTES:
+            output_path.unlink(missing_ok=True)
+            second = base_args[:-1] + ["-b:v", "850k", "-maxrate", "850k", "-bufsize", "1700k", "-b:a", "64k", base_args[-1]]
+            result = subprocess.run(second, capture_output=True, text=True, timeout=240)
+            if result.returncode != 0 or not output_path.exists():
+                raise RuntimeError("Не удалось сжать видео до лимита Telegram")
+
+        processed = output_path.read_bytes()
+        if not processed or len(processed) > TELEGRAM_MAX_VIDEO_BYTES:
+            raise RuntimeError("Готовое видео превышает 20 МБ. Попробуйте более короткий исходный файл.")
+        return processed
+
+
+async def process_latest_video(chat_id):
+    workflow = get_workflow(chat_id)
+    media = None
+    if workflow and workflow["media_id"]:
+        media = get_media(chat_id, workflow["media_id"])
+    if not media or media["processed_file_id"]:
+        media = get_latest_media(chat_id, needs_processing=True)
+    if not media:
+        latest = get_latest_media(chat_id)
+        if latest and latest["processed_file_id"]:
+            await telegram_send_message(chat_id, "Последнее видео уже обработано. Нажмите «🚀 Опубликовать видео» или отправьте новое видео.", telegram_main_keyboard())
+        else:
+            previous_source = workflow["source_url"] if workflow else None
+            set_workflow(chat_id, "waiting_video_file", source_url=previous_source)
+            await telegram_send_message(
+                chat_id,
+                "Сначала отправьте сюда исходный видеофайл MP4, MOV или WEBM размером до 20 МБ. Используйте своё видео или материал, на который у вас есть разрешение. Затем нажмите «✨ Обработать видео».",
+                telegram_main_keyboard(),
+            )
+        return
+
+    await telegram_send_message(chat_id, "⏳ Готовлю видео: привожу к вертикальному формату 9:16, сохраняю весь кадр и перекодирую в MP4…")
+    try:
+        original = await telegram_download_file(media["original_file_id"])
+        processed = await asyncio.to_thread(transcode_video, original)
+        sent = await telegram_send_video_bytes(
+            chat_id,
+            processed,
+            "✅ Готово! Это подготовленная версия вашего видео. Проверьте результат перед публикацией.",
+        )
+        sent_video = sent.get("video") or sent.get("document") or {}
+        processed_file_id = sent_video.get("file_id")
+        if not processed_file_id:
+            raise RuntimeError("Telegram не вернул file_id обработанного видео")
+        with db_connect() as db:
+            db.execute(
+                "UPDATE media_files SET processed_file_id = ?, status = 'processed', processed_at = ? WHERE id = ? AND chat_id = ?",
+                (processed_file_id, int(time.time()), media["id"], str(chat_id)),
+            )
+        set_workflow(chat_id, "ready_publish", source_url=media["source_url"], media_id=media["id"])
+        await telegram_send_message(
+            chat_id,
+            "Следующий шаг: посмотрите готовый ролик выше. Если всё устраивает, нажмите «🚀 Опубликовать видео». Файл также сохранён в «📁 Мои файлы».",
+            telegram_main_keyboard(),
+        )
+    except Exception as exc:
+        print(f"Video processing error for chat {chat_id}: {exc}")
+        await telegram_send_message(chat_id, "Не удалось обработать видео: " + str(exc), telegram_main_keyboard())
+
+
+async def publish_latest_processed_video(chat_id):
+    open_id = get_telegram_open_id(chat_id)
+    if not open_id:
+        await telegram_send_message(chat_id, "Сначала подключите TikTok: «👤 Мои аккаунты» → «➕ Добавить аккаунт» → «TikTok».", telegram_main_keyboard())
+        return
+
+    with db_connect() as db:
+        media = db.execute(
+            "SELECT * FROM media_files WHERE chat_id = ? AND processed_file_id IS NOT NULL AND published_at IS NULL ORDER BY id DESC LIMIT 1",
+            (str(chat_id),),
+        ).fetchone()
+        today_start = int(time.time()) - (int(time.time()) % 86400)
+        today_count = db.execute(
+            "SELECT COUNT(*) AS n FROM telegram_uploads WHERE chat_id = ? AND created_at >= ?",
+            (str(chat_id), today_start),
+        ).fetchone()["n"]
+
+    if not media:
+        latest = get_latest_media(chat_id)
+        if latest and not latest["processed_file_id"]:
+            await telegram_send_message(chat_id, "Сначала нажмите «✨ Обработать видео», чтобы подготовить последний загруженный ролик.", telegram_main_keyboard())
+        else:
+            await telegram_send_message(chat_id, "Пока нет готового видео. Сначала отправьте исходный ролик, затем нажмите «✨ Обработать видео».", telegram_main_keyboard())
+        return
+    if today_count >= DAILY_UPLOAD_LIMIT:
+        await telegram_send_message(chat_id, f"На сегодня достигнут лимит — {DAILY_UPLOAD_LIMIT} отправок в TikTok Inbox. Попробуйте завтра.", telegram_main_keyboard())
+        return
+
+    try:
+        await telegram_send_message(chat_id, "⏳ Отправляю подготовленное видео в TikTok Inbox…")
+        content = await telegram_download_file(media["processed_file_id"])
+        publish_id = await upload_video_bytes(open_id, content, "video/mp4")
+        now = int(time.time())
+        with db_connect() as db:
+            db.execute(
+                "INSERT INTO telegram_uploads (chat_id, created_at, publish_id) VALUES (?, ?, ?)",
+                (str(chat_id), now, publish_id),
+            )
+            db.execute(
+                "UPDATE media_files SET status = 'sent_to_inbox', published_at = ?, publish_id = ? WHERE id = ? AND chat_id = ?",
+                (now, publish_id, media["id"], str(chat_id)),
+            )
+        set_workflow(chat_id, "done", source_url=media["source_url"], media_id=media["id"])
+        await telegram_send_message(
+            chat_id,
+            "✅ Видео передано в TikTok Inbox. Откройте TikTok, найдите уведомление, проверьте подпись и завершите публикацию в приложении. Это ещё не означает, что ролик уже опубликован в профиле.",
+            telegram_main_keyboard(),
+        )
+    except HTTPException as exc:
+        await telegram_send_message(chat_id, "TikTok не принял видео: " + str(exc.detail), telegram_main_keyboard())
+    except Exception as exc:
+        print(f"TikTok publish upload error for chat {chat_id}: {exc}")
+        await telegram_send_message(chat_id, "Не удалось передать видео в TikTok Inbox: " + str(exc), telegram_main_keyboard())
+
+
+async def show_my_files(chat_id):
+    with db_connect() as db:
+        rows = db.execute(
+            "SELECT id, source_url, status, created_at FROM media_files WHERE chat_id = ? ORDER BY id DESC LIMIT 10",
+            (str(chat_id),),
+        ).fetchall()
+    if not rows:
+        await telegram_send_message(chat_id, "📁 Пока нет сохранённых видео. Нажмите «🔎 Найти видео», выберите ролик и отправьте сюда свой исходный файл с разрешением на использование.", telegram_main_keyboard())
+        return
+    status_names = {
+        "uploaded": "загружено, ожидает обработки",
+        "processed": "обработано, готово к проверке",
+        "sent_to_inbox": "передано в TikTok Inbox",
+    }
+    lines = ["📁 Ваши последние видео:"]
+    for row in rows:
+        stamp = time.strftime("%d.%m.%Y %H:%M", time.localtime(row["created_at"]))
+        lines.append(f"\n#{row['id']} · {stamp}\nСтатус: {status_names.get(row['status'], row['status'])}")
+        if row["source_url"]:
+            lines.append("Ссылка: " + row["source_url"][:250])
+    lines.append("\nВидео хранятся в Telegram, а CoveyAI сохраняет их file_id и статус в своей базе данных.")
+    await telegram_send_message(chat_id, "\n".join(lines), telegram_main_keyboard())
+
+
+async def show_stats(chat_id):
+    since = int(time.time()) - (int(time.time()) % 86400)
+    with db_connect() as db:
+        total_files = db.execute("SELECT COUNT(*) AS n FROM media_files WHERE chat_id = ?", (str(chat_id),)).fetchone()["n"]
+        processed = db.execute("SELECT COUNT(*) AS n FROM media_files WHERE chat_id = ? AND processed_file_id IS NOT NULL", (str(chat_id),)).fetchone()["n"]
+        sent_total = db.execute("SELECT COUNT(*) AS n FROM telegram_uploads WHERE chat_id = ?", (str(chat_id),)).fetchone()["n"]
+        sent_today = db.execute("SELECT COUNT(*) AS n FROM telegram_uploads WHERE chat_id = ? AND created_at >= ?", (str(chat_id), since)).fetchone()["n"]
+    await telegram_send_message(
+        chat_id,
+        f"📊 Статистика CoveyAI\nСохранено видео: {total_files}\nОбработано видео: {processed}\nОтправлено в TikTok Inbox всего: {sent_total}\nСегодня отправлено: {sent_today}/{DAILY_UPLOAD_LIMIT}",
+        telegram_main_keyboard(),
+    )
+
+
+async def handle_uploaded_video(message, chat_id):
+    video = message.get("video")
+    document = message.get("document")
+    file_id = None
+    file_size = 0
+    mime_type = "video/mp4"
+    if video:
+        file_id = video.get("file_id")
+        file_size = video.get("file_size", 0)
+        mime_type = video.get("mime_type") or "video/mp4"
+    elif document and (document.get("mime_type") or "").startswith("video/"):
+        file_id = document.get("file_id")
+        file_size = document.get("file_size", 0)
+        mime_type = document.get("mime_type")
+
+    if not file_id:
+        return False
+    if mime_type not in {"video/mp4", "video/quicktime", "video/webm", "video/x-matroska"}:
+        await telegram_send_message(chat_id, "Поддерживаются видео MP4, MOV или WEBM. Отправьте видео как файл, если Telegram не распознал его.", telegram_main_keyboard())
+        return True
+    if file_size and file_size > TELEGRAM_MAX_VIDEO_BYTES:
+        await telegram_send_message(chat_id, "Файл больше 20 МБ. Для этой версии бота нужен ролик до 20 МБ.", telegram_main_keyboard())
+        return True
+
+    workflow = get_workflow(chat_id)
+    source_url = workflow["source_url"] if workflow else None
+    media_id = save_media_file(chat_id, file_id, file_size, source_url=source_url)
+    await telegram_send_message(
+        chat_id,
+        f"✅ Видео сохранено в «Мои файлы» под номером #{media_id}.\n\nКогда будете готовы, нажмите «✨ Обработать видео». Используйте только собственные ролики или материалы, на которые у вас есть разрешение.",
+        telegram_main_keyboard(),
+    )
+    return True
 
 
 async def handle_telegram_message(message):
@@ -714,59 +1069,120 @@ async def handle_telegram_message(message):
         return
     text_value = (message.get("text") or "").strip()
 
-    if text_value in ("/start", "/menu", "⬅️ Главное меню"):
-        set_search_waiting(chat_id, False)
-        await telegram_send_message(
-            chat_id,
-            "Добро пожаловать в CoveyAI! Выберите нужный раздел в меню.",
-            reply_markup=telegram_main_keyboard(),
-        )
+    # Video uploads are stored first. They are never published automatically.
+    if await handle_uploaded_video(message, chat_id):
         return
 
-    # Direct command: /search football or /search футбол
+    if text_value in ("/start", "/menu", "⬅️ Главное меню"):
+        clear_workflow(chat_id)
+        await telegram_send_message(chat_id, "Добро пожаловать в CoveyAI! Выберите действие в меню.", telegram_main_keyboard())
+        return
+
+    if text_value in ("/cancel", "❌ Отмена", "Отмена"):
+        clear_workflow(chat_id)
+        await telegram_send_message(chat_id, "Текущий шаг отменён. Загруженные видео не удалены.", telegram_main_keyboard())
+        return
+
     if text_value.startswith("/search"):
         query = text_value[len("/search"):].strip()
-        set_search_waiting(chat_id, False)
         if query:
             await send_tiktok_search(chat_id, query)
         else:
             set_search_waiting(chat_id, True)
+            set_workflow(chat_id, "waiting_search_query")
+            await telegram_send_message(chat_id, "🔎 Напишите тему для поиска в TikTok. Например: футбол, машины, животные.\n\nДля отмены отправьте /cancel.", telegram_main_keyboard())
+        return
+
+    workflow = get_workflow(chat_id)
+    stage = workflow["stage"] if workflow else None
+
+    if text_value == "🔎 Найти видео":
+        set_search_waiting(chat_id, True)
+        set_workflow(chat_id, "waiting_search_query")
+        await telegram_send_message(chat_id, "🔎 Напишите тему для поиска в TikTok. Например: футбол, машины, животные.\n\nЯ пришлю ссылку на результаты поиска. Для отмены отправьте /cancel.", telegram_main_keyboard())
+        return
+
+    if stage == "waiting_search_query" and text_value and not text_value.startswith("/"):
+        set_search_waiting(chat_id, False)
+        await send_tiktok_search(chat_id, text_value)
+        return
+
+    if stage == "waiting_tiktok_link" and text_value:
+        if is_tiktok_video_url(text_value):
+            set_workflow(chat_id, "waiting_video_file", source_url=text_value)
             await telegram_send_message(
                 chat_id,
-                "🔎 Напишите тему для поиска в TikTok. Например: футбол, машины, животные.",
+                "✅ Ссылка на выбранный ролик сохранена.\n\nТеперь отправьте исходный видеофайл, который принадлежит вам или на использование которого у вас есть разрешение. По одной ссылке бот не скачивает чужое видео.\n\nПосле загрузки нажмите «✨ Обработать видео».",
                 telegram_main_keyboard(),
             )
+        else:
+            await telegram_send_message(chat_id, "Это не похоже на ссылку на отдельный ролик TikTok. Отправьте ссылку вида https://www.tiktok.com/@user/video/123… или короткую vm.tiktok.com ссылку.", telegram_main_keyboard())
+        return
+
+    if text_value.startswith("http://") or text_value.startswith("https://"):
+        if is_tiktok_video_url(text_value):
+            set_workflow(chat_id, "waiting_video_file", source_url=text_value)
+            await telegram_send_message(chat_id, "✅ Ссылка сохранена. Теперь отправьте свой исходный видеофайл или файл с разрешением на использование. Затем нажмите «✨ Обработать видео».", telegram_main_keyboard())
+        else:
+            await telegram_send_message(chat_id, "Я принимаю ссылки на отдельные ролики TikTok. Начните с кнопки «🔎 Найти видео» или отправьте ссылку на TikTok-ролик.", telegram_main_keyboard())
         return
 
     if text_value == "🔥 TikTok тренды":
         await telegram_send_message(
             chat_id,
-            "🔥 TikTok Creative Center — раздел с популярными видео и трендами:\n"
+            "🔥 TikTok Creative Center — тренды и популярные темы:\n"
             "https://ads.tiktok.com/creative/creativeCenter/trends/video?region=UA&period=7\n\n"
-            "Откройте ролик, чтобы посмотреть тренд. CoveyAI пока не скачивает чужие TikTok-ролики.\n"
-            "Для обработки и отправки в TikTok Inbox загрузите своё видео или материал, на который у вас есть разрешение.",
+            "Откройте интересующий ролик. CoveyAI не скачивает чужие ролики по ссылке; для обработки загрузите свой исходный файл или разрешённый материал.",
             telegram_main_keyboard(),
         )
         return
 
-    if text_value == "📱 Наше приложение":
-        await telegram_send_message(chat_id, "🌐 Откройте сайт CoveyAI:\n" + SITE_URL, telegram_main_keyboard())
+    if text_value == "✨ Обработать видео":
+        await process_latest_video(chat_id)
+        return
+
+    if text_value == "🚀 Опубликовать видео":
+        await publish_latest_processed_video(chat_id)
+        return
+
+    if text_value == "📁 Мои файлы":
+        await show_my_files(chat_id)
+        return
+
+    if text_value == "📊 Статистика":
+        await show_stats(chat_id)
+        return
+
+    if text_value == "💳 Монетизация":
+        await telegram_send_message(
+            chat_id,
+            "💳 Монетизация\nСейчас CoveyAI работает в тестовом бесплатном режиме: до 5 отправок в TikTok Inbox в день. Платёжная система не подключена, подписки и списания не оформляются. Эта кнопка показывает текущий статус, а не принимает оплату.",
+            telegram_main_keyboard(),
+        )
         return
 
     if text_value == "👤 Мои аккаунты":
-        await telegram_send_message(chat_id, "Раздел аккаунтов. Здесь можно подключить TikTok и посмотреть подключённые аккаунты.", telegram_accounts_keyboard())
+        open_id = get_telegram_open_id(chat_id)
+        if open_id:
+            await telegram_send_message(chat_id, "✅ TikTok подключён.\nID аккаунта: " + html.escape(open_id) + "\n\nInstagram и YouTube в этой версии ещё не подключены.", telegram_accounts_keyboard())
+        else:
+            await telegram_send_message(chat_id, "TikTok пока не подключён. Нажмите «➕ Добавить аккаунт» → «TikTok». Instagram и YouTube пока не подключены.", telegram_accounts_keyboard())
         return
 
     if text_value == "➕ Добавить аккаунт":
-        await telegram_send_message(
-            chat_id,
-            "Выберите платформу для подключения. Сейчас доступен TikTok.",
-            telegram_accounts_keyboard(),
-        )
+        await telegram_send_message(chat_id, "В этой версии доступно подключение TikTok. Выберите TikTok ниже.", telegram_accounts_keyboard())
         return
 
     if text_value == "TikTok":
         await telegram_start_tiktok_link(chat_id)
+        return
+
+    if text_value == "Instagram":
+        await telegram_send_message(chat_id, "Instagram пока не подключён в CoveyAI. Эта кнопка сообщает статус; публикация в Instagram ещё не настроена.", telegram_accounts_keyboard())
+        return
+
+    if text_value == "YouTube":
+        await telegram_send_message(chat_id, "YouTube пока не подключён в CoveyAI. Эта кнопка сообщает статус; публикация в YouTube ещё не настроена.", telegram_accounts_keyboard())
         return
 
     if text_value == "👁 Мои аккаунты":
@@ -774,113 +1190,32 @@ async def handle_telegram_message(message):
         if open_id:
             await telegram_send_message(chat_id, "✅ TikTok подключён.\nID аккаунта: " + html.escape(open_id), telegram_accounts_keyboard())
         else:
-            await telegram_send_message(chat_id, "Пока не подключено ни одного аккаунта. Нажмите «➕ Добавить аккаунт», чтобы подключить TikTok.", telegram_accounts_keyboard())
+            await telegram_send_message(chat_id, "Пока не подключено ни одного аккаунта. Нажмите «➕ Добавить аккаунт» → «TikTok».", telegram_accounts_keyboard())
         return
 
-    if text_value == "🔎 Найти видео":
-        set_search_waiting(chat_id, True)
-        await telegram_send_message(
-            chat_id,
-            "🔎 Напишите тему для поиска видео в TikTok. Например: футбол, машины, животные, путешествия.\n\n"
-            "Я отправлю ссылку на результаты поиска.",
-            telegram_main_keyboard(),
-        )
+    if text_value == "📱 Наше приложение":
+        await telegram_send_message(chat_id, "🌐 Откройте сайт CoveyAI:\n" + SITE_URL, telegram_main_keyboard())
         return
 
-    if text_value == "✨ Обработать видео":
-        await telegram_send_message(chat_id, "✨ ИИ-обработка и монтаж — следующий модуль. Он будет редактировать ваши видео, а не обходить авторские права или системы распознавания.", telegram_main_keyboard())
+    if text_value:
+        await telegram_send_message(chat_id, "Не распознал команду. Используйте кнопки меню или /cancel, чтобы отменить текущий шаг.", telegram_main_keyboard())
         return
 
-    if text_value == "🚀 Опубликовать видео":
-        if not get_telegram_open_id(chat_id):
-            await telegram_send_message(chat_id, "Сначала подключите TikTok: «Мои аккаунты» → «Добавить аккаунт».", telegram_main_keyboard())
-        else:
-            await telegram_send_message(chat_id, "Отправьте сюда видео MP4, MOV или WEBM размером до 20 МБ. Я передам его в ваш TikTok Inbox как загрузку для дальнейшего оформления и публикации.", telegram_main_keyboard())
-        return
-
-    if text_value == "💳 Монетизация":
-        await telegram_send_message(chat_id, "💳 Раздел подписок и оплаты готовится. Сейчас платные списания не подключены, поэтому ничего оплачивать не нужно.", telegram_main_keyboard())
-        return
-
-    if text_value == "📁 Мои файлы":
-        await telegram_send_message(chat_id, "📁 Хранилище файлов — следующий модуль. Пока файлы не сохраняются в личной библиотеке бота.", telegram_main_keyboard())
-        return
-
-    if text_value == "📊 Статистика":
-        since = int(time.time()) - (int(time.time()) % 86400)
-        with db_connect() as db:
-            total = db.execute("SELECT COUNT(*) AS n FROM telegram_uploads WHERE chat_id = ?", (str(chat_id),)).fetchone()["n"]
-            today = db.execute("SELECT COUNT(*) AS n FROM telegram_uploads WHERE chat_id = ? AND created_at >= ?", (str(chat_id), since)).fetchone()["n"]
-        await telegram_send_message(chat_id, f"📊 Ваша статистика\nУспешных отправок всего: {total}\nСегодня: {today}\nДневной лимит на старте: 5 видео.", telegram_main_keyboard())
-        return
-
-    # Accept an uploaded Telegram video/document and send it to the linked TikTok inbox.
-    video = message.get("video")
-    document = message.get("document")
-    file_id = None
-    content_type = None
-    file_size = 0
-    if video:
-        file_id = video.get("file_id")
-        content_type = video.get("mime_type") or "video/mp4"
-        file_size = video.get("file_size", 0)
-    elif document and (document.get("mime_type") or "").startswith("video/"):
-        file_id = document.get("file_id")
-        content_type = document.get("mime_type")
-        file_size = document.get("file_size", 0)
-
-    if file_id:
-        open_id = get_telegram_open_id(chat_id)
-        if not open_id:
-            await telegram_send_message(chat_id, "Сначала подключите TikTok через «Мои аккаунты» → «Добавить аккаунт».", telegram_main_keyboard())
-            return
-        if file_size and file_size > TELEGRAM_FILE_LIMIT:
-            await telegram_send_message(chat_id, "Файл больше 20 МБ. Пока Telegram не позволяет боту скачать такой файл. Загрузку больших видео через сайт добавим отдельно.", telegram_main_keyboard())
-            return
-        with db_connect() as db:
-            today_count = db.execute(
-                "SELECT COUNT(*) AS n FROM telegram_uploads WHERE chat_id = ? AND created_at >= ?",
-                (str(chat_id), int(time.time()) - (int(time.time()) % 86400)),
-            ).fetchone()["n"]
-        if today_count >= 5:
-            await telegram_send_message(chat_id, "На сегодня достигнут стартовый лимит — 5 видео. Попробуйте завтра.", telegram_main_keyboard())
-            return
-        try:
-            await telegram_send_message(chat_id, "⏳ Получаю видео и отправляю его в TikTok Inbox…")
-            content = await telegram_download_file(file_id)
-            publish_id = await upload_video_bytes(open_id, content, content_type)
-            with db_connect() as db:
-                db.execute(
-                    "INSERT INTO telegram_uploads (chat_id, created_at, publish_id) VALUES (?, ?, ?)",
-                    (str(chat_id), int(time.time()), publish_id),
-                )
-            await telegram_send_message(chat_id, "✅ Видео передано в TikTok Inbox. Откройте TikTok, найдите уведомление и завершите оформление и публикацию там.", telegram_main_keyboard())
-        except HTTPException as exc:
-            await telegram_send_message(chat_id, "Не удалось отправить видео в TikTok: " + str(exc.detail), telegram_main_keyboard())
-        except Exception as exc:
-            print(f"Telegram video upload error: {exc}")
-            await telegram_send_message(chat_id, "Не удалось обработать файл. Проверьте формат MP4, MOV или WEBM и попробуйте ещё раз.", telegram_main_keyboard())
-        return
-
-    # A topic entered after pressing the search button becomes a TikTok search link.
-    if text_value and is_search_waiting(chat_id) and not text_value.startswith("/"):
-        set_search_waiting(chat_id, False)
-        await send_tiktok_search(chat_id, text_value)
-        return
-
-    if text_value in ("Instagram", "YouTube"):
-        await telegram_send_message(chat_id, f"{text_value} пока не подключён. Сейчас работает только TikTok; остальные платформы добавим позже.", telegram_accounts_keyboard())
-        return
-
-    await telegram_send_message(chat_id, "Выберите раздел с помощью кнопок меню.", telegram_main_keyboard())
+    await telegram_send_message(chat_id, "Выберите действие с помощью кнопок меню.", telegram_main_keyboard())
 
 
 @app.post(TELEGRAM_WEBHOOK_PATH)
-async def telegram_webhook(request: Request):
+async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
     if not TELEGRAM_BOT_TOKEN:
         raise HTTPException(503, "Telegram bot is not configured")
     update = await request.json()
     message = update.get("message")
-    if message:
+    if message and (message.get("text") or "").strip() == "✨ Обработать видео":
+        # Video conversion can take longer than a webhook request should remain open.
+        # Send the HTTP acknowledgement first, then process the saved Telegram file.
+        chat_id = (message.get("chat") or {}).get("id")
+        if chat_id:
+            background_tasks.add_task(process_latest_video, chat_id)
+    elif message:
         await handle_telegram_message(message)
     return {"ok": True}
