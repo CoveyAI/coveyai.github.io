@@ -21,8 +21,8 @@ SESSION_SECRET = os.environ["SESSION_SECRET"]
 
 DATABASE_PATH = os.getenv("DATABASE_PATH", "./coveyai.db")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-PIXABAY_API_KEY = os.getenv("PIXABAY_API_KEY", "").strip()
-PIXABAY_SEARCH_URL = "https://pixabay.com/api/videos/"
+PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "").strip()
+PEXELS_SEARCH_URL = "https://api.pexels.com/videos/search"
 PUBLIC_BASE_URL = os.getenv(
     "PUBLIC_BASE_URL", "https://coveyai-github-io.onrender.com"
 ).rstrip("/")
@@ -234,7 +234,7 @@ async def health():
         "status": "ok",
         "service": "CoveyAI",
         "telegram_configured": bool(TELEGRAM_BOT_TOKEN),
-        "pixabay_configured": bool(PIXABAY_API_KEY),
+        "pexels_configured": bool(PEXELS_API_KEY),
     }
 
 
@@ -538,8 +538,9 @@ SITE_URL = "https://coveyai.github.io/"
 def telegram_main_keyboard():
     return {
         "keyboard": [
-            [{"text": "🔎 Найти видео"}, {"text": "✨ Обработать видео"}],
-            [{"text": "🚀 Опубликовать видео"}, {"text": "💳 Монетизация"}],
+            [{"text": "🔎 Найти видео"}, {"text": "🔥 TikTok тренды"}],
+            [{"text": "✨ Обработать видео"}, {"text": "🚀 Опубликовать видео"}],
+            [{"text": "💳 Монетизация"}],
             [{"text": "📁 Мои файлы"}, {"text": "📊 Статистика"}],
             [{"text": "👤 Мои аккаунты"}, {"text": "📱 Наше приложение"}],
         ],
@@ -615,42 +616,31 @@ def is_search_waiting(chat_id):
     return bool(row and row["waiting_for_query"])
 
 
-async def search_pixabay_videos(query):
-    if not PIXABAY_API_KEY:
-        raise RuntimeError("Не настроен PIXABAY_API_KEY в Environment на Render.")
+async def search_pexels_videos(query):
+    if not PEXELS_API_KEY:
+        raise RuntimeError("Pexels API key is not configured on the server")
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.get(
-            PIXABAY_SEARCH_URL,
-            params={
-                "key": PIXABAY_API_KEY,
-                "q": query,
-                "per_page": 5,
-                "safesearch": "true",
-                "order": "popular",
-            },
+            PEXELS_SEARCH_URL,
+            headers={"Authorization": PEXELS_API_KEY},
+            params={"query": query, "per_page": 5, "orientation": "portrait"},
         )
-    if response.status_code in (401, 403):
-        raise RuntimeError("Pixabay не принял API-ключ. Проверьте PIXABAY_API_KEY в Render.")
+    if response.status_code == 401:
+        raise RuntimeError("Pexels не принял API-ключ. Проверьте PEXELS_API_KEY в Render.")
     if response.status_code == 429:
-        raise RuntimeError("Pixabay временно ограничил частоту запросов. Попробуйте позже.")
+        raise RuntimeError("Pexels временно ограничил частоту запросов. Попробуйте немного позже.")
     if response.status_code != 200:
-        raise RuntimeError(f"Pixabay вернул ошибку поиска (HTTP {response.status_code}).")
-    try:
-        data = response.json()
-    except Exception:
-        raise RuntimeError("Pixabay вернул некорректный ответ.")
-    return data.get("hits", [])
+        raise RuntimeError(f"Pexels вернул ошибку поиска (HTTP {response.status_code}).")
+    return response.json().get("videos", [])
 
 
-def choose_pixabay_video_file(video):
-    variants = video.get("videos", {})
-    # Small/medium files are more reliable for Telegram previews.
-    for quality in ("small", "medium", "large", "tiny"):
-        item = variants.get(quality) or {}
-        url = item.get("url")
-        if url:
-            return url
-    return None
+def choose_pexels_video_file(video):
+    files = [f for f in video.get("video_files", []) if f.get("file_type") == "video/mp4" and f.get("link")]
+    if not files:
+        return None
+    # Prefer a moderate-size HD/SD MP4 to make Telegram preview more reliable.
+    files.sort(key=lambda f: (0 if f.get("quality") == "sd" else 1, f.get("width") or 99999))
+    return files[0]["link"]
 
 
 async def telegram_set_webhook():
@@ -738,6 +728,17 @@ async def handle_telegram_message(message):
         )
         return
 
+    if text_value == "🔥 TikTok тренды":
+        await telegram_send_message(
+            chat_id,
+            "🔥 TikTok Creative Center — раздел с популярными видео и трендами:\n"
+            "https://ads.tiktok.com/creative/creativeCenter/trends/video?region=UA&period=7\n\n"
+            "Откройте ролик, чтобы посмотреть тренд. CoveyAI пока не скачивает чужие TikTok-ролики.\n"
+            "Для обработки и отправки в TikTok Inbox загрузите своё видео или материал, на который у вас есть разрешение.",
+            telegram_main_keyboard(),
+        )
+        return
+
     if text_value == "📱 Наше приложение":
         await telegram_send_message(chat_id, "🌐 Откройте сайт CoveyAI:\n" + SITE_URL, telegram_main_keyboard())
         return
@@ -767,11 +768,11 @@ async def handle_telegram_message(message):
         return
 
     if text_value == "🔎 Найти видео":
-        if not PIXABAY_API_KEY:
-            await telegram_send_message(chat_id, "Для поиска нужно добавить PIXABAY_API_KEY в Environment на Render. Сам ключ в чат не отправляйте.", telegram_main_keyboard())
+        if not PEXELS_API_KEY:
+            await telegram_send_message(chat_id, "Для поиска нужно добавить PEXELS_API_KEY в Environment на Render. Сам ключ в чат не отправляйте.", telegram_main_keyboard())
             return
         set_search_waiting(chat_id, True)
-        await telegram_send_message(chat_id, "🔎 Напишите тему для поиска видео на Pixabay. Например: nature, city, travel, cats. Будут показаны ролики из библиотеки Pixabay с ссылкой на источник.", telegram_main_keyboard())
+        await telegram_send_message(chat_id, "🔎 Напишите тему для поиска видео на Pexels. Например: nature, city, travel, cats. Будут показаны ролики из библиотеки Pexels с ссылкой на источник.", telegram_main_keyboard())
         return
 
     if text_value == "✨ Обработать видео":
@@ -854,28 +855,27 @@ async def handle_telegram_message(message):
         set_search_waiting(chat_id, False)
         try:
             await telegram_send_message(chat_id, f"🔎 Ищу видео по запросу: {query}…")
-            videos = await search_pixabay_videos(query)
+            videos = await search_pexels_videos(query)
             if not videos:
                 await telegram_send_message(chat_id, "По этому запросу видео не нашлись. Попробуйте другие ключевые слова.", telegram_main_keyboard())
                 return
-            await telegram_send_message(chat_id, f"Нашёл {len(videos)} видео на Pixabay. Ниже — предпросмотр и ссылка на страницу каждого ролика.")
+            await telegram_send_message(chat_id, f"Нашёл {len(videos)} видео на Pexels. Ниже — предпросмотр и ссылка на страницу каждого ролика.")
             for index, item in enumerate(videos, start=1):
-                preview_url = choose_pixabay_video_file(item)
-                video_info = (item.get("videos", {}).get("small") or item.get("videos", {}).get("medium") or {})
-                title = f"Видео {index} · {item.get('duration', '?')} сек. · {video_info.get('width', '?')}×{video_info.get('height', '?')}"
-                source_url = item.get("pageURL", "https://pixabay.com/")
-                photographer = item.get("user", "Автор Pixabay")
+                title = f"Видео {index} · {item.get('duration', '?')} сек. · {item.get('width', '?')}×{item.get('height', '?')}"
+                source_url = item.get("url", "")
+                preview_url = choose_pexels_video_file(item)
+                photographer = item.get("user", {}).get("name", "Автор Pexels")
                 if preview_url:
                     try:
                         await telegram_send_video(chat_id, preview_url, f"{title}\nАвтор: {photographer}\nИсточник: {source_url}")
                     except Exception as preview_error:
-                        print(f"Pixabay preview send failed: {preview_error}")
+                        print(f"Pexels preview send failed: {preview_error}")
                         await telegram_send_message(chat_id, f"{title}\nАвтор: {photographer}\nОткрыть видео: {source_url}")
                 else:
                     await telegram_send_message(chat_id, f"{title}\nАвтор: {photographer}\nОткрыть видео: {source_url}")
-            await telegram_send_message(chat_id, "Выберите понравившийся ролик на Pixabay и убедитесь, что условия лицензии подходят для вашего использования. На следующем этапе добавим сохранение выбранного ролика в «Мои файлы» и передачу в обработку.", telegram_main_keyboard())
+            await telegram_send_message(chat_id, "Выберите понравившийся ролик на Pexels и убедитесь, что условия лицензии подходят для вашего использования. На следующем этапе добавим сохранение выбранного ролика в «Мои файлы» и передачу в обработку.", telegram_main_keyboard())
         except Exception as exc:
-            print(f"Pixabay search error: {exc}")
+            print(f"Pexels search error: {exc}")
             await telegram_send_message(chat_id, "Не удалось выполнить поиск: " + str(exc), telegram_main_keyboard())
         return
 
