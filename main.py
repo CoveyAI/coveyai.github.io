@@ -264,6 +264,8 @@ async def health():
         "media_library": "telegram_file_ids_and_sqlite",
         "video_processing": "ffmpeg_vertical_mp4",
         "publishing": "tiktok_inbox",
+        "direct_media_url_hosts_configured": bool(MEDIA_URL_ALLOWED_HOSTS),
+        "publish_job_mode": "background_with_status_messages",
     }
 
 
@@ -567,6 +569,13 @@ TIKTOK_SEARCH_URL = "https://www.tiktok.com/search?q={}"
 TELEGRAM_MAX_VIDEO_BYTES = 20 * 1024 * 1024
 MAX_PROCESS_SECONDS = 180
 DAILY_UPLOAD_LIMIT = 5
+# Optional HTTPS hosts that may serve user-owned/licensed direct video files.
+# Example Render Environment value: media.example.com,cdn.example.com
+MEDIA_URL_ALLOWED_HOSTS = {
+    item.strip().lower().lstrip(".")
+    for item in os.getenv("MEDIA_URL_ALLOWED_HOSTS", "").split(",")
+    if item.strip()
+}
 
 
 def telegram_main_keyboard():
@@ -724,6 +733,83 @@ def is_tiktok_video_url(value):
         return ("/video/" in path) or host in {"vm.tiktok.com", "vt.tiktok.com"}
     except Exception:
         return False
+
+
+def is_allowed_media_url(value):
+    """Accept only HTTPS direct video URLs hosted on explicitly allowlisted domains."""
+    try:
+        parsed = urlparse(value.strip())
+        host = (parsed.hostname or "").lower().rstrip(".")
+        if parsed.scheme != "https" or not host or parsed.username or parsed.password:
+            return False
+        if parsed.port not in (None, 443):
+            return False
+        if not any(host == allowed or host.endswith("." + allowed)
+                   for allowed in MEDIA_URL_ALLOWED_HOSTS):
+            return False
+        path = parsed.path.lower()
+        return path.endswith((".mp4", ".mov", ".webm"))
+    except (ValueError, TypeError):
+        return False
+
+
+async def download_authorized_media_url(url):
+    """Download a direct video file from a user-configured trusted HTTPS host."""
+    if not is_allowed_media_url(url):
+        raise RuntimeError(
+            "Эта ссылка не является прямой ссылкой MP4/MOV/WEBM с разрешённого домена. "
+            "TikTok-ссылка подходит для выбора ролика, но не является исходным файлом."
+        )
+
+    chunks = []
+    total = 0
+    async with httpx.AsyncClient(timeout=90, follow_redirects=False) as client:
+        async with client.stream("GET", url, headers={"User-Agent": "CoveyAI/1.0"}) as response:
+            if response.status_code in (301, 302, 303, 307, 308):
+                raise RuntimeError(
+                    "Хранилище перенаправило ссылку. Добавьте конечный HTTPS-домен в "
+                    "MEDIA_URL_ALLOWED_HOSTS и отправьте прямую ссылку на MP4."
+                )
+            if response.status_code != 200:
+                raise RuntimeError(f"Не удалось получить видео по ссылке (HTTP {response.status_code}).")
+            content_type = response.headers.get("content-type", "").split(";", 1)[0].lower()
+            if not (content_type.startswith("video/") or content_type == "application/octet-stream"):
+                raise RuntimeError("Ссылка открывает не видеофайл. Нужен прямой MP4, MOV или WEBM.")
+            declared_size = response.headers.get("content-length")
+            if declared_size and declared_size.isdigit() and int(declared_size) > TELEGRAM_MAX_VIDEO_BYTES:
+                raise RuntimeError("Видео по ссылке больше 20 МБ. Для текущей версии нужен файл до 20 МБ.")
+            async for chunk in response.aiter_bytes(1024 * 256):
+                total += len(chunk)
+                if total > TELEGRAM_MAX_VIDEO_BYTES:
+                    raise RuntimeError("Видео по ссылке больше 20 МБ. Для текущей версии нужен файл до 20 МБ.")
+                chunks.append(chunk)
+
+    content = b"".join(chunks)
+    if not content:
+        raise RuntimeError("По ссылке получен пустой файл.")
+    return content
+
+
+async def save_media_from_direct_url(chat_id, url):
+    """Fetch an allowlisted direct media URL, send it to Telegram, and store its file_id."""
+    await telegram_send_message(chat_id, "⏳ Получаю видео по прямой ссылке…")
+    video_bytes = await download_authorized_media_url(url)
+    workflow = get_workflow(chat_id)
+    source_url = workflow["source_url"] if workflow else url
+    sent = await telegram_send_video_bytes(
+        chat_id,
+        video_bytes,
+        "✅ Видео по ссылке получено. Проверьте, что это ваш ролик или материал с разрешением. Теперь нажмите «✨ Обработать видео»."
+    )
+    sent_video = sent.get("video") or sent.get("document") or {}
+    file_id = sent_video.get("file_id")
+    if not file_id:
+        raise RuntimeError("Telegram не вернул file_id полученного видео.")
+    media_id = save_media_file(chat_id, file_id, len(video_bytes), source_url=source_url)
+    await telegram_send_message(
+        chat_id,
+        f"✅ Исходный файл сохранён в «📁 Мои файлы» под номером #{media_id}. Нажмите «✨ Обработать видео»."
+    )
 
 
 def get_media(chat_id, media_id):
@@ -934,7 +1020,7 @@ async def process_latest_video(chat_id):
         await telegram_send_message(chat_id, "Не удалось обработать видео: " + str(exc), telegram_main_keyboard())
 
 
-async def publish_latest_processed_video(chat_id):
+async def publish_latest_processed_video(chat_id, announce=True):
     open_id = get_telegram_open_id(chat_id)
     if not open_id:
         await telegram_send_message(chat_id, "Сначала подключите TikTok: «👤 Мои аккаунты» → «➕ Добавить аккаунт» → «TikTok».", telegram_main_keyboard())
@@ -962,8 +1048,19 @@ async def publish_latest_processed_video(chat_id):
         await telegram_send_message(chat_id, f"На сегодня достигнут лимит — {DAILY_UPLOAD_LIMIT} отправок в TikTok Inbox. Попробуйте завтра.", telegram_main_keyboard())
         return
 
+    # Reserve the selected item so repeated taps/webhook retries cannot send it twice.
+    with db_connect() as db:
+        reserved = db.execute(
+            "UPDATE media_files SET status = 'publishing' WHERE id = ? AND chat_id = ? AND published_at IS NULL AND status != 'publishing'",
+            (media["id"], str(chat_id)),
+        ).rowcount
+    if not reserved:
+        await telegram_send_message(chat_id, "⏳ Это видео уже отправляется или уже было передано в TikTok Inbox.", telegram_main_keyboard())
+        return
+
     try:
-        await telegram_send_message(chat_id, "⏳ Отправляю подготовленное видео в TikTok Inbox…")
+        if announce:
+            await telegram_send_message(chat_id, "⏳ Отправляю подготовленное видео в TikTok Inbox…")
         content = await telegram_download_file(media["processed_file_id"])
         publish_id = await upload_video_bytes(open_id, content, "video/mp4")
         now = int(time.time())
@@ -983,10 +1080,14 @@ async def publish_latest_processed_video(chat_id):
             telegram_main_keyboard(),
         )
     except HTTPException as exc:
-        await telegram_send_message(chat_id, "TikTok не принял видео: " + str(exc.detail), telegram_main_keyboard())
+        with db_connect() as db:
+            db.execute("UPDATE media_files SET status = 'processed' WHERE id = ? AND chat_id = ? AND published_at IS NULL", (media["id"], str(chat_id)))
+        await telegram_send_message(chat_id, "TikTok не принял видео: " + str(exc.detail) + "\nМожно проверить подключение и повторить отправку.", telegram_main_keyboard())
     except Exception as exc:
+        with db_connect() as db:
+            db.execute("UPDATE media_files SET status = 'processed' WHERE id = ? AND chat_id = ? AND published_at IS NULL", (media["id"], str(chat_id)))
         print(f"TikTok publish upload error for chat {chat_id}: {exc}")
-        await telegram_send_message(chat_id, "Не удалось передать видео в TikTok Inbox: " + str(exc), telegram_main_keyboard())
+        await telegram_send_message(chat_id, "Не удалось передать видео в TikTok Inbox: " + str(exc) + "\nМожно проверить подключение и повторить отправку.", telegram_main_keyboard())
 
 
 async def show_my_files(chat_id):
@@ -1112,7 +1213,7 @@ async def handle_telegram_message(message):
             set_workflow(chat_id, "waiting_video_file", source_url=text_value)
             await telegram_send_message(
                 chat_id,
-                "✅ Ссылка на выбранный ролик сохранена.\n\nТеперь отправьте исходный видеофайл, который принадлежит вам или на использование которого у вас есть разрешение. По одной ссылке бот не скачивает чужое видео.\n\nПосле загрузки нажмите «✨ Обработать видео».",
+                "✅ Ссылка на выбранный ролик сохранена.\n\nСама страница TikTok не даёт боту исходный MP4. Для обработки отправьте сюда свой исходный видеофайл ИЛИ прямую HTTPS-ссылку на MP4/MOV/WEBM с домена, добавленного в MEDIA_URL_ALLOWED_HOSTS на Render. Используйте только свои видео или материалы с разрешением. После получения файла нажмите «✨ Обработать видео».",
                 telegram_main_keyboard(),
             )
         else:
@@ -1122,9 +1223,23 @@ async def handle_telegram_message(message):
     if text_value.startswith("http://") or text_value.startswith("https://"):
         if is_tiktok_video_url(text_value):
             set_workflow(chat_id, "waiting_video_file", source_url=text_value)
-            await telegram_send_message(chat_id, "✅ Ссылка сохранена. Теперь отправьте свой исходный видеофайл или файл с разрешением на использование. Затем нажмите «✨ Обработать видео».", telegram_main_keyboard())
+            await telegram_send_message(
+                chat_id,
+                "✅ Ссылка TikTok сохранена как ссылка на выбранный ролик.\n\nЧтобы обработать его по ссылке, отправьте прямой HTTPS-адрес MP4/MOV/WEBM с домена, добавленного в MEDIA_URL_ALLOWED_HOSTS на Render. Обычная ссылка страницы TikTok не является ссылкой на MP4. Также можно отправить свой исходный файл в Telegram. Используйте только свои или разрешённые материалы.",
+                telegram_main_keyboard(),
+            )
+        elif is_allowed_media_url(text_value):
+            try:
+                await save_media_from_direct_url(chat_id, text_value)
+            except Exception as exc:
+                print(f"Direct media URL error for chat {chat_id}: {exc}")
+                await telegram_send_message(chat_id, "Не удалось получить видео по ссылке: " + str(exc), telegram_main_keyboard())
         else:
-            await telegram_send_message(chat_id, "Я принимаю ссылки на отдельные ролики TikTok. Начните с кнопки «🔎 Найти видео» или отправьте ссылку на TikTok-ролик.", telegram_main_keyboard())
+            await telegram_send_message(
+                chat_id,
+                "Я принимаю ссылки на отдельные ролики TikTok как ссылки для выбора, а для загрузки исходника — только прямые HTTPS-ссылки MP4/MOV/WEBM с домена, разрешённого в MEDIA_URL_ALLOWED_HOSTS. Можно также отправить исходный файл в Telegram.",
+                telegram_main_keyboard(),
+            )
         return
 
     if text_value == "🔥 TikTok тренды":
@@ -1210,12 +1325,15 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
         raise HTTPException(503, "Telegram bot is not configured")
     update = await request.json()
     message = update.get("message")
-    if message and (message.get("text") or "").strip() == "✨ Обработать видео":
-        # Video conversion can take longer than a webhook request should remain open.
-        # Send the HTTP acknowledgement first, then process the saved Telegram file.
+    if message:
+        text_value = (message.get("text") or "").strip()
         chat_id = (message.get("chat") or {}).get("id")
-        if chat_id:
+        if chat_id and text_value == "✨ Обработать видео":
+            # Long FFmpeg jobs run after the webhook acknowledgement; the job itself sends progress messages.
             background_tasks.add_task(process_latest_video, chat_id)
-    elif message:
-        await handle_telegram_message(message)
+        elif chat_id and text_value == "🚀 Опубликовать видео":
+            # TikTok upload runs after the webhook acknowledgement; the job sends start and final messages.
+            background_tasks.add_task(publish_latest_processed_video, chat_id, True)
+        else:
+            await handle_telegram_message(message)
     return {"ok": True}
