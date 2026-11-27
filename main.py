@@ -1,4 +1,3 @@
-
 import os
 import secrets
 import sqlite3
@@ -6,6 +5,7 @@ import math
 import time
 import html
 import hashlib
+from urllib.parse import quote_plus
 
 import httpx
 from fastapi import FastAPI, Request, UploadFile, File, HTTPException
@@ -21,8 +21,6 @@ SESSION_SECRET = os.environ["SESSION_SECRET"]
 
 DATABASE_PATH = os.getenv("DATABASE_PATH", "./coveyai.db")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-PIXABAY_API_KEY = os.getenv("PIXABAY_API_KEY", "").strip()
-PIXABAY_SEARCH_URL = "https://pixabay.com/api/videos/"
 PUBLIC_BASE_URL = os.getenv(
     "PUBLIC_BASE_URL", "https://coveyai-github-io.onrender.com"
 ).rstrip("/")
@@ -134,8 +132,7 @@ def get_user(open_id):
 # ============== ERROR HANDLING ==============
 
 def oauth_error(response, result):
-    # TikTok OAuth v2 returns errors at the top level:
-    # {"error": "...", "error_description": "...", "log_id": "..."}
+    # TikTok OAuth v2 returns errors at the top level.
     return {
         "detail": "TikTok OAuth returned an error",
         "http_status": response.status_code,
@@ -163,8 +160,6 @@ def check_oauth_response(response):
             detail=oauth_error(response, result),
         )
 
-    # OAuth v2 success response is FLAT: access_token, refresh_token,
-    # open_id, expires_in, refresh_expires_in. It is not wrapped in data.
     return result
 
 
@@ -234,7 +229,7 @@ async def health():
         "status": "ok",
         "service": "CoveyAI",
         "telegram_configured": bool(TELEGRAM_BOT_TOKEN),
-        "pixabay_configured": bool(PIXABAY_API_KEY),
+        "tiktok_search_mode": "search_link",
     }
 
 
@@ -529,10 +524,12 @@ async def upload_status(
         "data": data
     }
 
+
 # ============== TELEGRAM BOT ==============
 
 TG_API = "https://api.telegram.org/bot{}"
 SITE_URL = "https://coveyai.github.io/"
+TIKTOK_SEARCH_URL = "https://www.tiktok.com/search?q={}"
 
 
 def telegram_main_keyboard():
@@ -616,47 +613,30 @@ def is_search_waiting(chat_id):
     return bool(row and row["waiting_for_query"])
 
 
-async def search_pixabay_videos(query):
-    if not PIXABAY_API_KEY:
-        raise RuntimeError("Pixabay API key is not configured on the server (PIXABAY_API_KEY).")
-    async with httpx.AsyncClient(timeout=30) as client:
-        response = await client.get(
-            PIXABAY_SEARCH_URL,
-            params={
-                "key": PIXABAY_API_KEY,
-                "q": query,
-                "per_page": 5,
-                "safesearch": "true",
-                "video_type": "all",
-            },
+def make_tiktok_search_url(query):
+    """Create a TikTok search URL for a user-entered topic."""
+    safe_query = quote_plus(query.strip())
+    return TIKTOK_SEARCH_URL.format(safe_query)
+
+
+async def send_tiktok_search(chat_id, query):
+    query = query.strip()[:100]
+    if not query:
+        await telegram_send_message(
+            chat_id,
+            "Напишите тему для поиска. Например: футбол, машины, животные.",
+            telegram_main_keyboard(),
         )
-    if response.status_code == 400:
-        raise RuntimeError("Pixabay отклонил параметры поиска. Проверьте запрос и настройки API.")
-    if response.status_code == 429:
-        raise RuntimeError("Pixabay временно ограничил частоту запросов. Попробуйте позже.")
-    if response.status_code == 401 or response.status_code == 403:
-        raise RuntimeError("Pixabay не принял API-ключ. Проверьте PIXABAY_API_KEY в Render.")
-    if response.status_code != 200:
-        raise RuntimeError(f"Pixabay вернул ошибку поиска (HTTP {response.status_code}).")
-    payload = response.json()
-    if payload.get("totalHits", 0) == 0:
-        return []
-    return payload.get("hits", [])
+        return
 
-
-def choose_pixabay_video_file(video):
-    variants = video.get("videos") or {}
-    # Prefer medium/small MP4 for reliable Telegram previews and reasonable size.
-    for quality in ("medium", "small", "large", "tiny"):
-        item = variants.get(quality) or {}
-        url = item.get("url")
-        if url and url.lower().split("?")[0].endswith(".mp4"):
-            return url
-    for item in variants.values():
-        url = item.get("url") if isinstance(item, dict) else None
-        if url and url.lower().split("?")[0].endswith(".mp4"):
-            return url
-    return None
+    search_url = make_tiktok_search_url(query)
+    await telegram_send_message(
+        chat_id,
+        f"🔎 Поиск TikTok по запросу: {query}\n\n"
+        f"Откройте результаты поиска:\n{search_url}\n\n"
+        "Это ссылка на поиск внутри TikTok. Бот пока не получает автоматически список роликов и не скачивает их.",
+        telegram_main_keyboard(),
+    )
 
 
 async def telegram_set_webhook():
@@ -669,7 +649,6 @@ async def telegram_set_webhook():
             "drop_pending_updates": False,
         })
     except Exception as exc:
-        # The API still starts; /health reports whether the token is configured.
         print(f"Telegram webhook setup failed: {exc}")
 
 
@@ -744,6 +723,21 @@ async def handle_telegram_message(message):
         )
         return
 
+    # Direct command: /search football or /search футбол
+    if text_value.startswith("/search"):
+        query = text_value[len("/search"):].strip()
+        set_search_waiting(chat_id, False)
+        if query:
+            await send_tiktok_search(chat_id, query)
+        else:
+            set_search_waiting(chat_id, True)
+            await telegram_send_message(
+                chat_id,
+                "🔎 Напишите тему для поиска в TikTok. Например: футбол, машины, животные.",
+                telegram_main_keyboard(),
+            )
+        return
+
     if text_value == "🔥 TikTok тренды":
         await telegram_send_message(
             chat_id,
@@ -784,11 +778,13 @@ async def handle_telegram_message(message):
         return
 
     if text_value == "🔎 Найти видео":
-        if not PIXABAY_API_KEY:
-            await telegram_send_message(chat_id, "Для поиска нужно добавить PIXABAY_API_KEY в Environment на Render. Сам ключ в чат не отправляйте.", telegram_main_keyboard())
-            return
         set_search_waiting(chat_id, True)
-        await telegram_send_message(chat_id, "🔎 Напишите тему для поиска видео на Pixabay. Например: nature, city, travel, cats. Будут показаны ролики из библиотеки Pixabay с ссылкой на источник.", telegram_main_keyboard())
+        await telegram_send_message(
+            chat_id,
+            "🔎 Напишите тему для поиска видео в TikTok. Например: футбол, машины, животные, путешествия.\n\n"
+            "Я отправлю ссылку на результаты поиска.",
+            telegram_main_keyboard(),
+        )
         return
 
     if text_value == "✨ Обработать видео":
@@ -866,33 +862,10 @@ async def handle_telegram_message(message):
             await telegram_send_message(chat_id, "Не удалось обработать файл. Проверьте формат MP4, MOV или WEBM и попробуйте ещё раз.", telegram_main_keyboard())
         return
 
+    # A topic entered after pressing the search button becomes a TikTok search link.
     if text_value and is_search_waiting(chat_id) and not text_value.startswith("/"):
-        query = text_value[:100].strip()
         set_search_waiting(chat_id, False)
-        try:
-            await telegram_send_message(chat_id, f"🔎 Ищу видео по запросу: {query}…")
-            videos = await search_pixabay_videos(query)
-            if not videos:
-                await telegram_send_message(chat_id, "По этому запросу видео не нашлись. Попробуйте другие ключевые слова.", telegram_main_keyboard())
-                return
-            await telegram_send_message(chat_id, f"Нашёл {len(videos)} видео на Pixabay. Ниже — предпросмотр и ссылка на страницу каждого ролика.")
-            for index, item in enumerate(videos, start=1):
-                title = f"Видео {index} · {item.get('duration', '?')} сек. · {item.get('width', '?')}×{item.get('height', '?')}"
-                source_url = item.get("pageURL", "")
-                preview_url = choose_pixabay_video_file(item)
-                photographer = item.get("user", "Автор Pixabay")
-                if preview_url:
-                    try:
-                        await telegram_send_video(chat_id, preview_url, f"{title}\nАвтор: {photographer}\nИсточник: {source_url}")
-                    except Exception as preview_error:
-                        print(f"Pixabay preview send failed: {preview_error}")
-                        await telegram_send_message(chat_id, f"{title}\nАвтор: {photographer}\nОткрыть видео: {source_url}")
-                else:
-                    await telegram_send_message(chat_id, f"{title}\nАвтор: {photographer}\nОткрыть видео: {source_url}")
-            await telegram_send_message(chat_id, "Выберите понравившийся ролик на Pixabay и убедитесь, что условия лицензии подходят для вашего использования. На следующем этапе добавим сохранение выбранного ролика в «Мои файлы» и передачу в обработку.", telegram_main_keyboard())
-        except Exception as exc:
-            print(f"Pixabay search error: {exc}")
-            await telegram_send_message(chat_id, "Не удалось выполнить поиск: " + str(exc), telegram_main_keyboard())
+        await send_tiktok_search(chat_id, text_value)
         return
 
     if text_value in ("Instagram", "YouTube"):
